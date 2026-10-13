@@ -1,0 +1,21 @@
+# Discord Bot & Security Ignores
+node_modules/
+.env
+.env.local
+
+# Local SQLite Database Files (prevent committing live database)
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Process & PM2 Logs
+logs/
+*.log
+npm-debug.log*
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
