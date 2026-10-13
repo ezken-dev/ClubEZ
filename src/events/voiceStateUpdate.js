@@ -1,5 +1,6 @@
 import { CONFIG, getTierForLevel } from '../config.js';
 import { addVoiceXp } from '../database/db.js';
+import { handleTempVoiceVoiceStateUpdate } from '../services/tempVoiceService.js';
 
 // Map of active voice sessions: Map<userId, { channelId, joinedAt, intervalId }>
 const activeVoiceUsers = new Map();
@@ -8,6 +9,13 @@ export default {
   name: 'voiceStateUpdate',
   once: false,
   async execute(oldState, newState, client) {
+    // 1. TempVoice Channel Lifecycle
+    try {
+      await handleTempVoiceVoiceStateUpdate(oldState, newState, client);
+    } catch (e) {
+      console.error('[TEMP VOICE ERROR]', e.message);
+    }
+
     const member = newState.member || oldState.member;
     if (!member || member.user.bot) return;
 

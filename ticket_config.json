@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "openCategoryId": "",
+  "closedCategoryId": "",
+  "panelChannelId": "",
+  "logsChannelId": "",
+  "supportRoleIds": [],
+  "ticketCounter": 0,
+  "embedTitle": "Club EZKEN Support System",
+  "embedDescription": "Need assistance, have questions regarding your ranks, or want to report an issue?\nClick the button below to open a private ticket with the staff team.",
+  "embedColor": "#E50914",
+  "buttonLabel": "Create Ticket",
+  "buttonEmoji": "📩",
+  "namingScheme": "ticket-{count}",
+  "maxOpenPerUser": 1,
+  "autoTranscript": true
+}

@@ -1,6 +1,8 @@
 import { EmbedBuilder, PermissionFlagsBits } from 'discord.js';
 import { CONFIG } from '../config.js';
 import { updateReportStatus, getLeaderboard, createCase } from '../database/db.js';
+import { handleTempVoiceInteraction } from '../services/tempVoiceService.js';
+import { handleTicketInteraction } from '../services/ticketService.js';
 
 // Pre-mapped friendly role names for button toggle
 const ROLE_NAME_MAPPINGS = {
@@ -15,6 +17,18 @@ export default {
   once: false,
   async execute(interaction, client) {
     try {
+      // TempVoice & Ticket interactions (Buttons & Modals)
+      try {
+        await handleTempVoiceInteraction(interaction, client);
+      } catch (e) {
+        console.error('[TEMP VOICE INTERACTION ERROR]', e.message);
+      }
+
+      try {
+        await handleTicketInteraction(interaction, client);
+      } catch (e) {
+        console.error('[TICKET INTERACTION ERROR]', e.message);
+      }
       // =======================================================================
       // 1. SLASH COMMANDS
       // =======================================================================

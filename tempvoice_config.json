@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "categoryId": "",
+  "categoryName": "PRIVATE VC CHANNEL",
+  "creatorChannelId": "",
+  "creatorChannelName": "➕ Creator Channel",
+  "controlChannelId": "",
+  "controlChannelName": "✨・voice-command",
+  "defaultNameTemplate": "{username}'s Channel",
+  "defaultUserLimit": 0,
+  "defaultLocked": false,
+  "autoDeleteDelaySec": 3
+}
