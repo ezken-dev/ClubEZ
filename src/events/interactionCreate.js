@@ -79,6 +79,37 @@ export default {
           }
         }
 
+        // A2. Dynamic Self Role Button (by Role ID)
+        if (customId.startsWith('self_role_toggle_') || customId.startsWith('role_toggle_')) {
+          const roleId = customId.replace('self_role_toggle_', '').replace('role_toggle_', '');
+          const role = interaction.guild.roles.cache.get(roleId);
+          if (!role) {
+            return interaction.reply({ content: '❌ Role not found on this server.', ephemeral: true });
+          }
+
+          const hasRole = interaction.member.roles.cache.has(role.id);
+          try {
+            if (hasRole) {
+              await interaction.member.roles.remove(role);
+              return interaction.reply({
+                content: `🗑️ Removed **@${role.name}** from your profile.`,
+                ephemeral: true
+              });
+            } else {
+              await interaction.member.roles.add(role);
+              return interaction.reply({
+                content: `✅ Added **@${role.name}** to your profile!`,
+                ephemeral: true
+              });
+            }
+          } catch (rErr) {
+            return interaction.reply({
+              content: `❌ Could not modify role: Check bot permissions and hierarchy.`,
+              ephemeral: true
+            });
+          }
+        }
+
         // B. Moderator Triage Action Buttons on Reports / AI Alerts
         if (customId.startsWith('mod_report_')) {
           if (!interaction.member.permissions.has(PermissionFlagsBits.ModerateMembers)) {

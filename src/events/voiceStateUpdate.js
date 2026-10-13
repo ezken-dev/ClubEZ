@@ -1,4 +1,4 @@
-import { CONFIG } from '../config.js';
+import { CONFIG, getTierForLevel } from '../config.js';
 import { addVoiceXp } from '../database/db.js';
 
 // Map of active voice sessions: Map<userId, { channelId, joinedAt, intervalId }>
@@ -15,7 +15,7 @@ export default {
     const isAfkChannel = newState.guild.afkChannelId && newState.channelId === newState.guild.afkChannelId;
     const isDeafOrMuted = newState.selfDeaf || newState.serverDeaf;
 
-    // User left voice or moved to AFK
+    // User left voice, disconnected, or moved to AFK / deafened
     if (!newState.channelId || isAfkChannel || isDeafOrMuted) {
       if (activeVoiceUsers.has(userId)) {
         const session = activeVoiceUsers.get(userId);
@@ -25,12 +25,11 @@ export default {
       return;
     }
 
-    // User joined or moved to an eligible voice channel
+    // User joined or moved to an eligible active voice channel
     if (newState.channelId && !isAfkChannel && !isDeafOrMuted) {
       if (!activeVoiceUsers.has(userId)) {
-        // Poll every 60 seconds to award Voice XP
-        const intervalId = setInterval(() => {
-          // Re-verify member is still in active channel
+        // Poll every 60 seconds to award 8 Voice XP
+        const intervalId = setInterval(async () => {
           const currentMember = newState.guild.members.cache.get(userId);
           if (
             currentMember &&
@@ -38,7 +37,24 @@ export default {
             !currentMember.voice.selfDeaf &&
             !currentMember.voice.serverDeaf
           ) {
-            addVoiceXp(userId, CONFIG.XP.VOICE_PER_MINUTE);
+            const progress = addVoiceXp(userId, CONFIG.XP.VOICE_PER_MINUTE);
+            if (progress.leveledUp) {
+              const tier = getTierForLevel(progress.level);
+              const role = currentMember.guild.roles.cache.find(r =>
+                r.name.toLowerCase().replace(/[@\s]/g, '') === tier.name.toLowerCase().replace(/[@\s]/g, '')
+              );
+              if (role && !currentMember.roles.cache.has(role.id)) {
+                try {
+                  await currentMember.roles.add(role, `Voice level up promotion to Level ${progress.level}`);
+                  const logChannel = currentMember.guild.channels.cache.get(CONFIG.CHANNELS.LOGS);
+                  if (logChannel) {
+                    logChannel.send(`🎙️ **[VOICE LEVEL PROMOTION]** ${currentMember.user.tag} reached **Level ${progress.level}** (@${tier.name}) via voice chat!`);
+                  }
+                } catch (roleErr) {
+                  console.error('[VOICE LEVEL ROLE ERROR]', roleErr.message);
+                }
+              }
+            }
           } else {
             clearInterval(intervalId);
             activeVoiceUsers.delete(userId);

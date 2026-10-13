@@ -134,8 +134,9 @@ pm2 startup
 
 ## 🎯 Command Reference
 
-### Moderation
-- `/warn <user> <reason>` — Issues formal warning, logs incremental Case ID, DMs target.
+### Moderation & Permissions
+- `/syncpermissions` — **(Admin only)** Synchronizes Discord permissions for all 9 leveling roles (`@ROOKIE` through `@STAR SUPPORTER`).
+- `/warn <user> <reason>` — Issues formal warning with AI advice, logs Case ID, DMs target.
 - `/mute <user> <duration> <reason>` — Discord timeout (up to 28 days), DMs user, logs to `#mod-logs`.
 - `/kick <user> <reason>` — Removes member with audit logging.
 - `/ban <user> <reason> [delete_days]` — Bans user and purges recent messages.
@@ -147,11 +148,35 @@ pm2 startup
 - `/case history <user>` — Displays full infraction ledger for a user.
 
 ### Leveling & Community
-- `/rank [user]` — Renders real-time 934x282 PNG Rank Card with avatar, level, progress & rank.
-- `/leaderboard` — Interactive top 10 members with live refresh button.
-- `/reactionrole buttons` — Deploys interactive buttons for `@Stream Ping`, `@Blood Strike Squad`, etc.
+- `/rank [user]` — Renders real-time 934x282 PNG Rank Card with avatar, level, tier badge, VC time, and progress.
+- `/leaderboard` — Interactive top 10 members with VC minutes, message counts, and live refresh button.
+- `/reactionrole buttons` — Deploys interactive buttons for self-roles with instant toggle feedback.
 - `/reactionrole menu` — Deploys multi-choice role select dropdown.
 - `/embed create` — Builds custom Club EZKEN red `#E50914` embeds with buttons and templates.
 - `/embed load <template_name>` — Dispatches pre-saved embed from SQLite.
 - `/report <user> <reason>` — Dispatches triage ticket to `#mod-reports` with staff action buttons.
 - `/ping` — Measures WebSocket ping, roundtrip latency, and SQLite query speed.
+
+---
+
+## 🚀 How to Push to GitHub & Host 24/7
+
+1. **Initialize Git inside this folder:**
+   ```bash
+   git init
+   git add .
+   git commit -m "feat: Club EZKEN custom bot with hard leveling and smart AI moderation"
+   ```
+2. **Push to your GitHub repository:**
+   ```bash
+   git branch -M main
+   git remote add origin https://github.com/YOUR_USERNAME/club-ezken-bot.git
+   git push -u origin main
+   ```
+3. **Deploy Anywhere (Railway / VPS / Heroku / Pterodactyl):**
+   - Clone the repo: `git clone https://github.com/YOUR_USERNAME/club-ezken-bot.git`
+   - Run `npm install`
+   - Run `npm run deploy` to register slash commands in Discord
+   - Run `npm start` (or `pm2 start ecosystem.config.cjs`)
+   - The bot comes online immediately 24/7!
+

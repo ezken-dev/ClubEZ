@@ -94,7 +94,7 @@ if (fs.existsSync(eventsPath)) {
 // =============================================================================
 // CLIENT READY EVENT
 // =============================================================================
-client.once('ready', () => {
+client.once('clientReady', () => {
   console.log(`
   ==============================================================
    ██████╗██╗     ██╗   ██╗██████╗     ███████╗███████╗██╗  ██╗███████╗███╗   ██╗
@@ -124,6 +124,32 @@ client.once('ready', () => {
 
   // Start YouTube RSS Stream Poller
   initStreamWatcher(client);
+
+  // Heartbeat loop to keep process alive and log health every 60s
+  setInterval(() => {
+    if (client.isReady()) {
+      // Shard ping check
+      const wsPing = client.ws.ping;
+      // Keep-alive active
+    }
+  }, 60000);
+});
+
+// Shard Reconnection & Lifecycle Management
+client.on('shardError', (error, shardId) => {
+  console.error(`[GATEWAY ERROR] Shard ${shardId} encountered an error:`, error.message);
+});
+
+client.on('shardDisconnect', (event, shardId) => {
+  console.warn(`[GATEWAY DISCONNECT] Shard ${shardId} disconnected (code: ${event.code}). Auto-reconnecting...`);
+});
+
+client.on('shardReconnecting', (shardId) => {
+  console.log(`[GATEWAY RECONNECT] Shard ${shardId} reconnecting to Discord gateway...`);
+});
+
+client.on('shardResume', (shardId, replayedEvents) => {
+  console.log(`[GATEWAY RESUMED] Shard ${shardId} resumed session (${replayedEvents} events replayed).`);
 });
 
 // Start Bot

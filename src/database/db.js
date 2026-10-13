@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { CONFIG } from '../config.js';
+import { CONFIG, getTierForLevel } from '../config.js';
 
 // Ensure data directory exists
 const dbDir = path.dirname(CONFIG.DATABASE_PATH);
@@ -251,25 +251,38 @@ export function addVoiceXp(userId, amount) {
 }
 
 export function getLeaderboard(limit = 10) {
+  let list = [];
   if (!useFallback && sqliteDb) {
-    return sqliteDb.prepare(`
+    list = sqliteDb.prepare(`
       SELECT user_id, xp, level, total_messages, voice_minutes
       FROM users_xp
       ORDER BY level DESC, xp DESC
       LIMIT ?
     `).all(limit);
+  } else {
+    const allUsers = Object.values(store.users_xp);
+    allUsers.sort((a, b) => {
+      if (b.level !== a.level) return b.level - a.level;
+      return b.xp - a.xp;
+    });
+    list = allUsers.slice(0, limit);
   }
 
-  const allUsers = Object.values(store.users_xp);
-  allUsers.sort((a, b) => {
-    if (b.level !== a.level) return b.level - a.level;
-    return b.xp - a.xp;
+  return list.map((u, idx) => {
+    const tier = getTierForLevel(u.level);
+    return {
+      ...u,
+      rank: idx + 1,
+      tierRole: tier.name,
+      color: tier.color,
+      unlockedFeatures: tier.features
+    };
   });
-  return allUsers.slice(0, limit);
 }
 
 export function getUserRankPosition(userId) {
   const row = getUserXpData(userId);
+  const tier = getTierForLevel(row.level);
   if (!useFallback && sqliteDb) {
     const rankCount = sqliteDb.prepare(`
       SELECT COUNT(*) as rank FROM users_xp
@@ -279,6 +292,9 @@ export function getUserRankPosition(userId) {
     return {
       ...row,
       rank: rankCount.rank + 1,
+      tierRole: tier.name,
+      color: tier.color,
+      unlockedFeatures: tier.features,
       neededXp: CONFIG.XP.calcLevelXp(row.level)
     };
   }
@@ -289,6 +305,9 @@ export function getUserRankPosition(userId) {
   return {
     ...row,
     rank: rank || 1,
+    tierRole: tier.name,
+    color: tier.color,
+    unlockedFeatures: tier.features,
     neededXp: CONFIG.XP.calcLevelXp(row.level)
   };
 }

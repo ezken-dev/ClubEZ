@@ -20,12 +20,22 @@ if (CONFIG.GEMINI_API_KEY) {
 
 /**
  * Evaluates message text for toxic behavior, hate speech, severe harassment, or NSFW
+ * and generates personalized smart AI warnings with DO and DON'T advice.
  * @param {string} text The message content to evaluate
- * @returns {Promise<{flagged: boolean, confidence: number, categories: string[], reason: string, suggestedAction: string}>}
+ * @returns {Promise<{flagged: boolean, confidence: number, categories: string[], reason: string, suggestedAction: string, smartWarning: string, adviceDo: string, adviceDont: string}>}
  */
 export async function evaluateMessageWithAI(text) {
   if (!text || text.trim().length === 0) {
-    return { flagged: false, confidence: 0, categories: [], reason: 'Empty text', suggestedAction: 'NONE' };
+    return {
+      flagged: false,
+      confidence: 0,
+      categories: [],
+      reason: 'Empty text',
+      suggestedAction: 'NONE',
+      smartWarning: '',
+      adviceDo: '',
+      adviceDont: ''
+    };
   }
 
   // If Gemini API is not configured, fallback to heuristic safety scan
@@ -34,21 +44,25 @@ export async function evaluateMessageWithAI(text) {
   }
 
   try {
-    const prompt = `You are a real-time Discord community moderation AI for "Club EZKEN".
-Evaluate the following message content strictly for severe violations:
-- Toxicity or aggressive profanity targeted at members
-- Severe harassment or bullying
+    const prompt = `You are a real-time smart Discord community moderation AI for "Club EZKEN" (Ken's community).
+Evaluate the following message content strictly for violations:
+- Toxicity, insulting members, aggressive profanity targeted at people
+- Severe harassment, bullying, or intimidation
 - Hate speech or discrimination
-- NSFW / sexually explicit text
-- Dangerous spam, phishing, scams, or malicious links
+- NSFW / sexually explicit content
+- Dangerous spam, phishing, scam links, unauthorized discord invites
 
 Message to analyze:
 "${text.replace(/"/g, '\\"')}"
 
-Respond in structured JSON format according to the schema. If it is standard casual chat or friendly banter, mark flagged as false.`;
+If the message is acceptable, friendly banter, or normal gaming chat, return flagged: false.
+If flagged: true, you MUST write:
+1. "smartWarning": A direct, personalized message explaining to the user what they did wrong.
+2. "adviceDo": Practical, positive advice on what they SHOULD do instead in Club EZKEN.
+3. "adviceDont": Clear, firm advice on what they must NOT do going forward.`;
 
     const response = await aiClient.models.generateContent({
-      model: 'gemini-3.8-flash',
+      model: 'gemini-2.5-flash',
       contents: prompt,
       config: {
         responseMimeType: 'application/json',
@@ -66,9 +80,21 @@ Respond in structured JSON format according to the schema. If it is standard cas
             suggestedAction: {
               type: Type.STRING,
               description: 'Recommended action: DELETE, TIMEOUT, BAN, or NONE'
+            },
+            smartWarning: {
+              type: Type.STRING,
+              description: 'Direct personalized warning to send to the offending user'
+            },
+            adviceDo: {
+              type: Type.STRING,
+              description: 'What the user should do instead'
+            },
+            adviceDont: {
+              type: Type.STRING,
+              description: 'What the user must avoid doing'
             }
           },
-          required: ['flagged', 'confidence', 'categories', 'reason', 'suggestedAction']
+          required: ['flagged', 'confidence', 'categories', 'reason', 'suggestedAction', 'smartWarning', 'adviceDo', 'adviceDont']
         }
       }
     });
@@ -95,16 +121,22 @@ function fallbackHeuristicScan(text) {
         confidence: 0.95,
         categories: ['TOXICITY', 'SEVERE_HARASSMENT'],
         reason: `Matched severe prohibited keyword pattern (${kw})`,
-        suggestedAction: 'DELETE'
+        suggestedAction: 'DELETE',
+        smartWarning: `Your message violated Club EZKEN community guidelines due to prohibited language (${kw}). Respectful communication is strictly enforced.`,
+        adviceDo: 'Engage respectfully with community members, keep banter friendly, and take a breather if heated.',
+        adviceDont: 'Do not use slurs, toxic phrases, or targeted harassment in text or voice channels.'
       };
     }
   }
 
   return {
     flagged: false,
-    confidence: 0.1,
+    confidence: 0,
     categories: [],
-    reason: 'Heuristic clean',
-    suggestedAction: 'NONE'
+    reason: 'Clean',
+    suggestedAction: 'NONE',
+    smartWarning: '',
+    adviceDo: '',
+    adviceDont: ''
   };
 }

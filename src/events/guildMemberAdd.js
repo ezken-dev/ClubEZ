@@ -21,8 +21,10 @@ export default {
       }
     }
 
-    // 2. Generate Canvas Welcome Card & Post in #lounge-welcome
-    const welcomeChannel = member.guild.channels.cache.get(CONFIG.CHANNELS.WELCOME);
+    // 2. Generate Canvas Welcome Card & Post in #welcome
+    const welcomeChannel = member.guild.channels.cache.get(CONFIG.CHANNELS.WELCOME)
+      || member.guild.systemChannel
+      || member.guild.channels.cache.find(c => c.name.toLowerCase().includes('welcome'));
     if (welcomeChannel) {
       try {
         const avatarUrl = member.user.displayAvatarURL({ extension: 'png', size: 256, forceStatic: true });
