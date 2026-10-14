@@ -2087,8 +2087,17 @@ setInterval(async () => {
   }
 }, 60000);
 
-// Discord State Retrieval Helpers
+// Discord State Retrieval Helpers with Instant Gateway Cache
 async function fetchGuildChannels(): Promise<any[]> {
+  const liveGuild = discordBot.guilds.cache.get(DISCORD_GUILD_ID);
+  if (liveGuild && liveGuild.channels.cache.size > 0) {
+    return Array.from(liveGuild.channels.cache.values()).map((c: any) => ({
+      id: c.id,
+      name: c.name,
+      type: c.type,
+      parentId: c.parentId,
+    }));
+  }
   try {
     const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/channels`, {
       headers: getDiscordHeaders(),
@@ -2100,6 +2109,15 @@ async function fetchGuildChannels(): Promise<any[]> {
 }
 
 async function fetchGuildRoles(): Promise<any[]> {
+  const liveGuild = discordBot.guilds.cache.get(DISCORD_GUILD_ID);
+  if (liveGuild && liveGuild.roles.cache.size > 0) {
+    return Array.from(liveGuild.roles.cache.values()).map((r: any) => ({
+      id: r.id,
+      name: r.name,
+      color: r.color,
+      position: r.position,
+    }));
+  }
   try {
     const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/roles`, {
       headers: getDiscordHeaders(),
@@ -3433,6 +3451,9 @@ const moderateMemberDeclaration: FunctionDeclaration = {
   }
 };
 
+// In-memory deduplication cache: prevents duplicate execution if user double-submits or network retries
+const recentPromptExecutions = new Map<string, { timestamp: number; responseData: any }>();
+
 // -----------------------------------------------------------------------------
 // POST /api/gemini/architect - Autonomous Gemini AI Engine (with Image Upload)
 // -----------------------------------------------------------------------------
@@ -3443,6 +3464,14 @@ app.post('/api/gemini/architect', async (req: Request, res: Response) => {
 
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Prompt is required.' });
+    }
+
+    // Check recent execution cache (within 8 seconds) to prevent duplicate Discord posts
+    const cacheKey = `${prompt.trim().toLowerCase()}_${Boolean(imageBase64)}`;
+    const cached = recentPromptExecutions.get(cacheKey);
+    if (cached && Date.now() - cached.timestamp < 8000) {
+      console.log(`[AI ARCHITECT] Debounced duplicate prompt within 8s: "${prompt.slice(0, 40)}..."`);
+      return res.json(cached.responseData);
     }
 
     // Fetch current live channels and roles from Discord for live grounding
@@ -3486,9 +3515,10 @@ YOUR DIRECTIVES:
 
   let aiMessage = '';
   let modelWorked = false;
+  let activeModelUsed = 'Gemini 3.1 Flash Lite';
 
-  // Primary active model
-  const targetModel = 'gemini-3.8-flash';
+  // Fast model priority: gemini-3.1-flash-lite (~800ms) -> gemini-3.5-flash (~1.7s) -> gemini-3.8-flash
+  const candidateModels = ['gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash'];
 
   if (aiClient) {
     // Build multimodal content (text + optional image)
@@ -3512,10 +3542,10 @@ YOUR DIRECTIVES:
       contents = prompt;
     }
 
-    for (let attempt = 1; attempt <= 2; attempt++) {
+    for (const modelName of candidateModels) {
       try {
         const response = await aiClient.models.generateContent({
-          model: targetModel,
+          model: modelName,
           contents,
           config: {
             systemInstruction,
@@ -3531,12 +3561,15 @@ YOUR DIRECTIVES:
 
         aiMessage = response.text || '';
         modelWorked = true;
+        activeModelUsed = modelName === 'gemini-3.1-flash-lite'
+          ? 'Gemini 3.1 Flash Lite'
+          : modelName === 'gemini-3.5-flash'
+          ? 'Gemini 3.5 Flash'
+          : 'Gemini 3.8 Flash';
+        console.log(`[AI ARCHITECT] Successfully answered via ${activeModelUsed} in ${Date.now() - reqStartTime}ms with ${calls.length} action(s)`);
         break;
       } catch (modelErr: any) {
-        console.warn(`[AI ARCHITECT] ${targetModel} attempt ${attempt} warning: ${modelErr.message}`);
-        if (attempt < 2 && (modelErr.message.includes('503') || modelErr.message.includes('high demand'))) {
-          await new Promise(r => setTimeout(r, 1200));
-        }
+        console.warn(`[AI ARCHITECT] ${modelName} warning: ${modelErr.message}`);
       }
     }
   }
@@ -3559,10 +3592,10 @@ YOUR DIRECTIVES:
         `\n\nAll changes are live in Club EZKEN right now!`;
     }
   } else if (!aiMessage) {
-    aiMessage = `I've analyzed your server Club EZKEN (Guild ID: ${DISCORD_GUILD_ID}). Your server has ${currentChannels.length} channels and${currentRoles.length} roles. Let me know what you would like to build or modify — e.g. "Create a VIP role with gold color at level 25", "Create text channel scrims-chat", or "Delete channel tournament-chat"!`;
+    aiMessage = `I've analyzed your server Club EZKEN (Guild ID: ${DISCORD_GUILD_ID}). Your server has ${currentChannels.length} channels and ${currentRoles.length} roles. Let me know what you would like to build or modify — e.g. "Create a VIP role with gold color at level 25", "Create text channel scrims-chat", or "Delete channel tournament-chat"!`;
   }
 
-    return res.json({
+    const responsePayload = {
       message: aiMessage,
       actions: executedActions,
       levelTiers,
@@ -3571,13 +3604,18 @@ YOUR DIRECTIVES:
         rolesCount: currentRoles.length,
       },
       thinking: {
-        model: 'Gemini 3.8 Flash',
+        model: activeModelUsed,
         groundedChannels: currentChannels.length,
         groundedRoles: currentRoles.length,
         actionsCount: executedActions.length,
         durationMs: Date.now() - reqStartTime,
       }
-    });
+    };
+
+    // Store in short-lived deduplication cache
+    recentPromptExecutions.set(cacheKey, { timestamp: Date.now(), responseData: responsePayload });
+
+    return res.json(responsePayload);
   } catch (err: any) {
     console.error('[AI ARCHITECT ERROR]', err?.stack || err?.message || err);
     return res.status(500).json({ error: err?.message || 'AI Architect failed. Please try again.' });
