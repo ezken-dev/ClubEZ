@@ -99,7 +99,7 @@ const DISCORD_GUILD_ID = process.env.DISCORD_GUILD_ID || '1559297780613390346';
 const DISCORD_CLIENT_ID = process.env.DISCORD_CLIENT_ID || '1559382791093751848';
 export const MOD_LOGS_CHANNEL_ID = '1559441137624678440'; // Official Club EZKEN 📋｜mod-logs channel
 
-// Gemini API Key initialization
+// Gemini API Key initialization (must be supplied via GEMINI_API_KEY in Bot-Hosting Env tab)
 const geminiApiKey = process.env.GEMINI_API_KEY || '';
 let aiClient: GoogleGenAI | null = null;
 
@@ -1132,7 +1132,7 @@ Return strictly a JSON object.`;
   if (aiClient) {
     try {
       const resp = await aiClient.models.generateContent({
-        model: 'gemini-1.5-flash',
+        model: 'gemini-3.8-flash',
         contents: prompt,
         config: {
           responseMimeType: 'application/json',
@@ -1568,7 +1568,7 @@ The next incoming member slot is now accurately synchronized to #${newCount + 1}
 Generate a sharp, professional 2-line Discord audit note for #mod-logs confirming the departure, reporting the recalculated total of ${newCount} members, and confirming the next joining member will be numbered #${newCount + 1}. Use Discord Markdown.`;
 
         const resp = await aiClient.models.generateContent({
-          model: 'gemini-1.5-flash',
+          model: 'gemini-3.8-flash',
           contents: aiPrompt,
         });
         if (resp.text) {
@@ -2853,7 +2853,7 @@ The next incoming member slot is now synchronized to #${recalculatedTotal + 1}.
 Generate a sharp, professional 2-line Discord audit note for #mod-logs confirming the departure, reporting the recalculated total of ${recalculatedTotal} members, and confirming the next joining member will be numbered #${recalculatedTotal + 1}. Use Discord Markdown.`;
 
         const resp = await aiClient.models.generateContent({
-          model: 'gemini-1.5-flash',
+          model: 'gemini-3.8-flash',
           contents: aiPrompt,
         });
         if (resp.text) {
@@ -3295,7 +3295,7 @@ function parseNaturalLanguageIntent(prompt: string): Array<{ name: string; args:
   }
 
   // 6. Announcement Pattern (e.g. "send announcement welcoming everyone to Season 5")
-  const announceRegex = /(?:send|dispatch|post)\s+(?:an?\s+)?announcement\s+(?:to\s+([#a-zA-Z0-9_-]+)\s+)?(?:saying|with\s+title|welcoming)?\s*["']?([^"']+)["']?/i;
+  const announceRegex = /(?:send|dispatch|post|write)\s+(?:an?\s+)?announcement(?:\s+post)?(?:\s+(?:to|in)\s+([#a-zA-Z0-9_-]+)\s*)?(?:saying|with\s+title|welcoming)?\s*["']?([^"']*)["']?/i;
   const announceMatch = text.match(announceRegex);
   if (announceMatch && !actions.some(a => a.name === 'send_announcement')) {
     actions.push({
@@ -3303,7 +3303,23 @@ function parseNaturalLanguageIntent(prompt: string): Array<{ name: string; args:
       args: {
         channelName: announceMatch[1] ? announceMatch[1].replace('#', '') : 'announcements',
         title: 'Club EZKEN Official Broadcast',
-        description: announceMatch[2] || 'Welcome to Club EZKEN community update!',
+        description: announceMatch[2] || '📢 Welcome to Club EZKEN! Check out the channels, level up in voice comms, and enjoy the community!',
+        colorHex: '#E50914',
+      },
+    });
+  }
+
+  // 7. Test / Welcome Message Pattern (e.g. "test a welcoming message and send it in #general")
+  const welcomeMsgRegex = /(?:test|send|post)\s+(?:a\s+)?(?:welcoming\s+|welcome\s+)?(?:message|embed)?\s*(?:and\s+send\s+it\s+)?(?:in|to)\s+([#a-zA-Z0-9_-]+)/i;
+  const welcomeMsgMatch = text.match(welcomeMsgRegex);
+  if (welcomeMsgMatch && !actions.some(a => a.name === 'send_announcement')) {
+    const targetChan = welcomeMsgMatch[1].replace('#', '');
+    actions.push({
+      name: 'send_announcement',
+      args: {
+        channelName: targetChan,
+        title: '🎉 Welcome to Club EZKEN!',
+        description: 'Welcome to the official **Club EZKEN** server! Comms, scrims, leveling, and private temp VCs are all active. Enjoy your stay!',
         colorHex: '#E50914',
       },
     });
@@ -3470,54 +3486,62 @@ YOUR DIRECTIVES:
   let aiMessage = '';
   let modelWorked = false;
 
-  // Model candidate priority: gemini-1.5-flash first (most reliable & fast), then gemini-1.5-flash-8b, then gemini-2.0-flash
-  const modelCandidates = ['gemini-1.5-flash', 'gemini-1.5-flash-8b', 'gemini-2.0-flash'];
+  // Model priority: gemini-3.8-flash (primary active AI Studio model), followed by fallbacks
+  const modelCandidates = ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'];
 
   if (aiClient) {
-    for (const model of modelCandidates) {
-      try {
-        // Build multimodal content (text + optional image)
-        let contents: any;
-        if (imageBase64 && imageMimeType) {
-          contents = [
+    // Build multimodal content (text + optional image)
+    let contents: any;
+    if (imageBase64 && imageMimeType) {
+      contents = [
+        {
+          role: 'user',
+          parts: [
             {
-              role: 'user',
-              parts: [
-                {
-                  inlineData: {
-                    data: imageBase64,
-                    mimeType: imageMimeType,
-                  },
-                },
-                { text: prompt },
-              ],
+              inlineData: {
+                data: imageBase64,
+                mimeType: imageMimeType,
+              },
             },
-          ];
-        } else {
-          contents = prompt;
+            { text: prompt },
+          ],
+        },
+      ];
+    } else {
+      contents = prompt;
+    }
+
+    for (const model of modelCandidates) {
+      // Up to 3 attempts with backoff for temporary 503 high-demand spikes
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const response = await aiClient.models.generateContent({
+            model,
+            contents,
+            config: {
+              systemInstruction,
+              tools,
+            },
+          });
+
+          const calls = response.functionCalls || [];
+          for (const call of calls) {
+            const receipt = await executeServerAction(call.name || '', call.args || {}, currentChannels, currentRoles);
+            executedActions.push(receipt);
+          }
+
+          aiMessage = response.text || '';
+          modelWorked = true;
+          break; // Success on this model
+        } catch (modelErr: any) {
+          console.warn(`[AI ARCHITECT] Model ${model} attempt ${attempt} warning: ${modelErr.message}`);
+          if (attempt < 3 && (modelErr.message.includes('503') || modelErr.message.includes('high demand') || modelErr.message.includes('rate'))) {
+            await new Promise(r => setTimeout(r, 1000 * attempt));
+          }
         }
-
-        const response = await aiClient.models.generateContent({
-          model,
-          contents,
-          config: {
-            systemInstruction,
-            tools,
-          },
-        });
-
-        const calls = response.functionCalls || [];
-        for (const call of calls) {
-          const receipt = await executeServerAction(call.name || '', call.args || {}, currentChannels, currentRoles);
-          executedActions.push(receipt);
-        }
-
-        aiMessage = response.text || '';
-        modelWorked = true;
-        break; // Successfully got response from model
-      } catch (modelErr: any) {
-        console.warn(`[AI ARCHITECT] Model ${model} encountered issue:${modelErr.message}`);
       }
+
+      if (modelWorked) break;
     }
   }
 
@@ -3618,7 +3642,7 @@ app.post('/api/aimod/evaluate', async (req: Request, res: Response) => {
   }
 
   if (aiClient) {
-    for (const model of ['gemini-1.5-flash', 'gemini-1.5-flash-8b', 'gemini-2.0-flash']) {
+    for (const model of ['gemini-3.8-flash', 'gemini-3.8-flash-8b', 'gemini-2.0-flash']) {
       try {
         const prompt = `You are a real-time Discord community moderation AI for "Club EZKEN".
 Analyze the following message sent by "${username}" in "${channelName}" strictly for community violations:
@@ -3683,7 +3707,7 @@ app.post('/api/discord/smart-warn', async (req: Request, res: Response) => {
   const { username = 'Member', deletedContent = '', reason = '', categories = [], channelName = '#general' } = req.body;
 
   if (aiClient) {
-    for (const model of ['gemini-1.5-flash', 'gemini-1.5-flash-8b', 'gemini-2.0-flash']) {
+    for (const model of ['gemini-3.8-flash', 'gemini-3.8-flash-8b', 'gemini-2.0-flash']) {
       try {
         const response = await aiClient.models.generateContent({
           model,

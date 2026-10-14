@@ -179,17 +179,36 @@ export async function handleTempVoiceVoiceStateUpdate(
   const member = newState.member || oldState.member;
   if (!member || member.user.bot) return;
 
-  // 1. Check if user joined the Creator Channel
-  if (newState.channelId && newState.channelId === config.creatorChannelId) {
+  // 1. Check if user joined the Creator Channel (matches either by ID or by name)
+  const joinedChannel = newState.channel;
+  const isCreatorJoin = newState.channelId && (
+    (config.creatorChannelId && newState.channelId === config.creatorChannelId) ||
+    (joinedChannel?.name && (
+      joinedChannel.name.includes('Creator Channel') ||
+      joinedChannel.name.includes('➕') ||
+      joinedChannel.name.toLowerCase().includes('creator')
+    ))
+  );
+
+  if (isCreatorJoin) {
     try {
       const guild = newState.guild;
+      // Auto-heal configuration if ID was missing or changed
+      if (config.creatorChannelId !== newState.channelId) {
+        config.creatorChannelId = newState.channelId!;
+        if (joinedChannel?.parentId) config.categoryId = joinedChannel.parentId;
+        saveTempVoiceConfig(config);
+      }
+
       const rawTemplate = config.defaultNameTemplate || "{username}'s Channel";
       const channelName = rawTemplate
         .replace('{username}', member.displayName || member.user.username)
         .replace('{tag}', member.user.tag);
 
-      // Category resolution
-      const parentCategory = config.categoryId ? guild.channels.cache.get(config.categoryId) : null;
+      // Category resolution: try config category, fallback to parent of Creator Channel
+      const parentCategory = config.categoryId
+        ? guild.channels.cache.get(config.categoryId)
+        : (joinedChannel?.parentId ? guild.channels.cache.get(joinedChannel.parentId) : null);
 
       // Create new private voice channel
       const newVc = await guild.channels.create({
