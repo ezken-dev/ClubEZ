@@ -2,10 +2,12 @@
   "name": "club-ezken-bot",
   "version": "1.0.0",
   "description": "Production-ready Discord.js v14 custom bot replacing Sapphire & MEE6 for Club EZKEN",
-  "main": "src/index.js",
+  "main": "server.ts",
   "type": "module",
   "scripts": {
-    "start": "node src/index.js",
+    "start": "npx tsx server.ts",
+    "start:js": "node src/index.js",
+    "start:ts": "npx tsx server.ts",
     "deploy": "node src/deploy-commands.js",
     "pm2:start": "pm2 start ecosystem.config.cjs",
     "pm2:logs": "pm2 logs club-ezken-bot",
@@ -16,7 +18,15 @@
     "@napi-rs/canvas": "^0.1.65",
     "@google/genai": "^2.4.0",
     "dotenv": "^16.4.7",
-    "fast-xml-parser": "^4.5.1"
+    "fast-xml-parser": "^4.5.1",
+    "express": "^4.21.2",
+    "jszip": "^3.10.1"
+  },
+  "devDependencies": {
+    "typescript": "^5.7.2",
+    "tsx": "^4.19.2",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.10.5"
   },
   "engines": {
     "node": ">=18.0.0"

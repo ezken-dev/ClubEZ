@@ -2,7 +2,8 @@ module.exports = {
   apps: [
     {
       name: 'club-ezken-bot',
-      script: 'src/index.js',
+      script: 'npx',
+      args: 'tsx server.ts',
       instances: 1,
       autorestart: true,
       watch: false,

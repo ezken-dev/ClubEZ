@@ -35,7 +35,7 @@ import {
   activeTempVcs,
   autoSetupTempVoice,
   buildTempVoiceInterface
-} from './src/services/tempVoiceService.ts';
+} from './src/services/tempVoiceService.js';
 
 import {
   handleTicketInteraction,
@@ -44,7 +44,7 @@ import {
   ticketStore,
   autoSetupTickets,
   buildTicketPanelInterface
-} from './src/services/ticketService.ts';
+} from './src/services/ticketService.js';
 
 dotenv.config();
 
