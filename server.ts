@@ -56,7 +56,8 @@ const app = express();
 // UPDATE 1: Added Bot-Hosting's custom SERVER_PORT requirement
 const PORT = process.env.SERVER_PORT || process.env.PORT || 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // UPDATE 2: Added CORS bypass to prevent Netlify / Browser blocking errors
 app.use((req, res, next) => {
@@ -1108,7 +1109,7 @@ Return strictly a JSON object.`;
   if (aiClient) {
     try {
       const resp = await aiClient.models.generateContent({
-        model: 'gemini-3.8-flash',
+        model: 'gemini-1.5-flash',
         contents: prompt,
         config: {
           responseMimeType: 'application/json',
@@ -1544,7 +1545,7 @@ The next incoming member slot is now accurately synchronized to #${newCount + 1}
 Generate a sharp, professional 2-line Discord audit note for #mod-logs confirming the departure, reporting the recalculated total of ${newCount} members, and confirming the next joining member will be numbered #${newCount + 1}. Use Discord Markdown.`;
 
         const resp = await aiClient.models.generateContent({
-          model: 'gemini-3.8-flash',
+          model: 'gemini-1.5-flash',
           contents: aiPrompt,
         });
         if (resp.text) {
@@ -2829,7 +2830,7 @@ The next incoming member slot is now synchronized to #${recalculatedTotal + 1}.
 Generate a sharp, professional 2-line Discord audit note for #mod-logs confirming the departure, reporting the recalculated total of ${recalculatedTotal} members, and confirming the next joining member will be numbered #${recalculatedTotal + 1}. Use Discord Markdown.`;
 
         const resp = await aiClient.models.generateContent({
-          model: 'gemini-3.8-flash',
+          model: 'gemini-1.5-flash',
           contents: aiPrompt,
         });
         if (resp.text) {
@@ -3397,15 +3398,16 @@ const moderateMemberDeclaration: FunctionDeclaration = {
 // POST /api/gemini/architect - Autonomous Gemini AI Engine (with Image Upload)
 // -----------------------------------------------------------------------------
 app.post('/api/gemini/architect', async (req: Request, res: Response) => {
-  const { prompt, imageBase64, imageMimeType } = req.body;
+  try {
+    const { prompt, imageBase64, imageMimeType } = req.body;
 
-  if (!prompt || typeof prompt !== 'string') {
-    return res.status(400).json({ error: 'Prompt is required.' });
-  }
+    if (!prompt || typeof prompt !== 'string') {
+      return res.status(400).json({ error: 'Prompt is required.' });
+    }
 
-  // Fetch current live channels and roles from Discord for live grounding
-  const currentChannels = await fetchGuildChannels();
-  const currentRoles = await fetchGuildRoles();
+    // Fetch current live channels and roles from Discord for live grounding
+    const currentChannels = await fetchGuildChannels();
+    const currentRoles = await fetchGuildRoles();
 
   const executedActions: ActionReceipt[] = [];
   const tools = [{
@@ -3445,8 +3447,8 @@ YOUR DIRECTIVES:
   let aiMessage = '';
   let modelWorked = false;
 
-  // Model candidate priority: gemini-3.5-flash first (most reliable & fast), then gemini-3.1-flash-lite, then gemini-3.8-flash
-  const modelCandidates = ['gemini-3.5-flash', 'gemini-3.1-flash-lite', 'gemini-3.8-flash'];
+  // Model candidate priority: gemini-1.5-flash first (most reliable & fast), then gemini-1.5-flash-8b, then gemini-2.0-flash
+  const modelCandidates = ['gemini-1.5-flash', 'gemini-1.5-flash-8b', 'gemini-2.0-flash'];
 
   if (aiClient) {
     for (const model of modelCandidates) {
@@ -3517,15 +3519,19 @@ YOUR DIRECTIVES:
     aiMessage = `I've analyzed your server Club EZKEN (Guild ID: ${DISCORD_GUILD_ID}). Your server has ${currentChannels.length} channels and${currentRoles.length} roles. Let me know what you would like to build or modify — e.g. "Create a VIP role with gold color at level 25", "Create text channel scrims-chat", or "Delete channel tournament-chat"!`;
   }
 
-  return res.json({
-    message: aiMessage,
-    actions: executedActions,
-    levelTiers,
-    guildStats: {
-      channelsCount: currentChannels.length,
-      rolesCount: currentRoles.length,
-    }
-  });
+    return res.json({
+      message: aiMessage,
+      actions: executedActions,
+      levelTiers,
+      guildStats: {
+        channelsCount: currentChannels.length,
+        rolesCount: currentRoles.length,
+      }
+    });
+  } catch (err: any) {
+    console.error('[AI ARCHITECT ERROR]', err?.stack || err?.message || err);
+    return res.status(500).json({ error: err?.message || 'AI Architect failed. Please try again.' });
+  }
 });
 
 // -----------------------------------------------------------------------------
@@ -3589,7 +3595,7 @@ app.post('/api/aimod/evaluate', async (req: Request, res: Response) => {
   }
 
   if (aiClient) {
-    for (const model of ['gemini-3.5-flash', 'gemini-3.1-flash-lite', 'gemini-3.8-flash']) {
+    for (const model of ['gemini-1.5-flash', 'gemini-1.5-flash-8b', 'gemini-2.0-flash']) {
       try {
         const prompt = `You are a real-time Discord community moderation AI for "Club EZKEN".
 Analyze the following message sent by "${username}" in "${channelName}" strictly for community violations:
@@ -3654,7 +3660,7 @@ app.post('/api/discord/smart-warn', async (req: Request, res: Response) => {
   const { username = 'Member', deletedContent = '', reason = '', categories = [], channelName = '#general' } = req.body;
 
   if (aiClient) {
-    for (const model of ['gemini-3.5-flash', 'gemini-3.1-flash-lite', 'gemini-3.8-flash']) {
+    for (const model of ['gemini-1.5-flash', 'gemini-1.5-flash-8b', 'gemini-2.0-flash']) {
       try {
         const response = await aiClient.models.generateContent({
           model,
@@ -4390,6 +4396,15 @@ async function startServer() {
     console.log(`[SERVER] API Server is running on port ${PORT}`);
   });
 }
+
+// Global error handler — return JSON instead of Express's default HTML error pages
+app.use((err: any, _req: Request, res: Response, _next: any) => {
+  console.error('[EXPRESS ERROR]', err?.stack || err?.message || err);
+  res.status(err?.status || 500).json({
+    error: err?.message || 'Internal server error',
+    stack: process.env.NODE_ENV === 'production' ? undefined : err?.stack,
+  });
+});
 
 startServer().catch((err) => {
   console.error('[SERVER ERROR]', err);
