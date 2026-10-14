@@ -65,8 +65,8 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health check endpoint
-app.get('/api/health', (_req: Request, res: Response) => {
+// Health check endpoint (both with and without /api/ prefix)
+app.get(['/health', '/api/health'], (_req: Request, res: Response) => {
   return res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -74,6 +74,14 @@ app.get('/api/health', (_req: Request, res: Response) => {
     port: PORT,
     env: process.env.NODE_ENV || 'development',
   });
+});
+
+// URL rewrite: If proxy stripped /api/ prefix, add it back so all routes match
+app.use((req, _res, next) => {
+  if (!req.url.startsWith('/api') && req.url !== '/' && !req.url.startsWith('/dist') && !req.url.startsWith('/assets')) {
+    req.url = '/api' + (req.url.startsWith('/') ? req.url : '/' + req.url);
+  }
+  next();
 });
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
