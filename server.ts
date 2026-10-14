@@ -30,14 +30,20 @@ import {
   joinVoiceChannel,
   getVoiceConnection,
   VoiceConnectionStatus,
+  AudioPlayerStatus,
+  NoSubscriberBehavior,
+  createAudioPlayer,
+  createAudioResource,
   entersState,
 } from '@discordjs/voice';
+import * as play from 'play-dl';
 
 import {
   handleTempVoiceVoiceStateUpdate,
   handleTempVoiceInteraction,
   loadTempVoiceConfig,
   saveTempVoiceConfig,
+  saveActiveTempVoiceChannels,
   activeTempVcs,
   autoSetupTempVoice,
   buildTempVoiceInterface
@@ -47,6 +53,7 @@ import {
   handleTicketInteraction,
   loadTicketConfig,
   saveTicketConfig,
+  saveActiveTickets,
   ticketStore,
   autoSetupTickets,
   buildTicketPanelInterface
@@ -287,6 +294,7 @@ interface MusicQueueItem {
   title: string;
   artist: string;
   duration: string;
+  durationSec?: number;
   thumbnail: string;
   url: string;
   source: 'youtube' | 'spotify' | 'soundcloud';
@@ -302,116 +310,318 @@ let musicVcChannelId: string | null = null;
 let musicLoopMode: 'off' | 'track' | 'queue' = 'off';
 let musicShuffleEnabled = false;
 let musicSeekPosition = 0;
+let musicLastError: string | null = null;
+let musicIsLoading = false;
+let musicCurrentResource: any = null;
+const musicPlayer = createAudioPlayer({
+  behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
+});
 
-// Real YouTube Search (fast, pure HTTP, extracts real title, artist, duration, thumbnail)
-async function searchYouTube(query: string, limit = 5): Promise<MusicQueueItem[]> {
-  try {
-    let cleanQuery = query.trim();
+musicPlayer.on('stateChange', (_oldState, newState) => {
+  musicIsPlaying = newState.status === AudioPlayerStatus.Playing;
+});
 
-    // Check if query is Spotify track URL
-    if (cleanQuery.includes('spotify.com/track/')) {
-      try {
-        const oembedRes = await fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(cleanQuery)}`);
-        if (oembedRes.ok) {
-          const sData: any = await oembedRes.json();
-          if (sData.title) {
-            cleanQuery = `${sData.title} ${sData.author_name || ''}`.trim();
-          }
-        }
-      } catch {}
+musicPlayer.on(AudioPlayerStatus.Idle, () => {
+  if (musicCurrentTrack) void advanceMusicQueue();
+});
+
+musicPlayer.on('error', (error) => {
+  musicLastError = error.message;
+  console.error('[MUSIC PLAYER ERROR]', error);
+  musicCurrentTrack = null;
+  musicCurrentResource = null;
+  void startNextMusicTrack();
+});
+
+// Resolve Spotify links to track metadata, then find the corresponding YouTube audio result.
+async function normalizeMusicQuery(query: string): Promise<{ query: string; source: 'youtube' | 'spotify' }> {
+  const cleanQuery = query.trim();
+  if (/open\.spotify\.com\/(?:track|album|playlist)\//i.test(cleanQuery)) {
+    try {
+      const response = await fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(cleanQuery)}`);
+      if (response.ok) {
+        const meta: any = await response.json();
+        if (meta.title) return { query: `${meta.title} ${meta.author_name || ''}`.trim(), source: 'spotify' };
+      }
+    } catch (error: any) {
+      console.warn('[MUSIC SPOTIFY METADATA]', error.message);
     }
+    throw new Error('Could not read this Spotify link. Try a public track link or search its title.');
+  }
+  return { query: cleanQuery, source: 'youtube' };
+}
 
-    // Direct YouTube video ID regex
-    const ytMatch = cleanQuery.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})/);
-    const fetchUrl = ytMatch
-      ? `https://www.youtube.com/watch?v=${ytMatch[1]}`
-      : `https://www.youtube.com/results?search_query=${encodeURIComponent(cleanQuery)}`;
+function formatTrackDuration(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return 'Live';
+  return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, '0')}`;
+}
 
-    const res = await fetch(fetchUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-    });
-    const html = await res.text();
-    const match = html.match(/var ytInitialData = ({.*?});<\/script>/);
-    if (!match) return [];
-    const data = JSON.parse(match[1]);
-    const sectionList = data.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
-    const contents = sectionList[0]?.itemSectionRenderer?.contents || [];
-    const results: MusicQueueItem[] = [];
+function fromYouTubeVideo(video: any, requestedBy = 'Dashboard', source: 'youtube' | 'spotify' = 'youtube'): MusicQueueItem {
+  const durationSec = Number(video.durationInSec) || 0;
+  return {
+    id: video.id || new URL(video.url).searchParams.get('v') || `yt_${Date.now()}`,
+    title: video.title || 'Untitled video',
+    artist: video.channel?.name || 'YouTube',
+    duration: video.durationRaw || formatTrackDuration(durationSec),
+    durationSec,
+    thumbnail: video.thumbnails?.[0]?.url || (video.id ? `https://i.ytimg.com/vi/${video.id}/hqdefault.jpg` : ''),
+    url: video.url,
+    source,
+    requestedBy,
+    addedAt: Date.now(),
+  };
+}
 
-    for (const item of contents) {
-      if (item.videoRenderer) {
-        const v = item.videoRenderer;
-        const videoId = v.videoId;
-        if (!videoId) continue;
-        const title = v.title?.runs?.[0]?.text || 'Unknown Title';
-        const artist = v.ownerText?.runs?.[0]?.text || 'YouTube Artist';
-        const duration = v.lengthText?.simpleText || '3:30';
-        const thumbnail = v.thumbnail?.thumbnails?.slice(-1)[0]?.url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+async function searchYouTube(query: string, limit = 5): Promise<MusicQueueItem[]> {
+  const normalized = await normalizeMusicQuery(query);
+  const isYouTubeUrl = /(?:youtube\.com|youtu\.be)/i.test(normalized.query);
+  if (isYouTubeUrl) {
+    const info: any = await play.video_info(normalized.query);
+    return [fromYouTubeVideo(info.video_details, 'Dashboard', normalized.source)];
+  }
+  const results = await play.search(normalized.query, {
+    limit,
+    source: { youtube: 'video' },
+  });
+  return results
+    .filter((video: any) => video?.url && video?.id && video.type === 'video')
+    .map((video: any) => fromYouTubeVideo(video, 'Dashboard', normalized.source));
+}
 
-        results.push({
-          id: videoId,
-          title,
-          artist,
-          duration,
-          thumbnail,
-          url: `https://www.youtube.com/watch?v=${videoId}`,
-          source: query.includes('spotify.com') ? 'spotify' : 'youtube',
-          requestedBy: 'KEN',
-          addedAt: Date.now(),
+async function startNextMusicTrack(): Promise<void> {
+  if (musicIsLoading) return;
+  musicIsLoading = true;
+  try {
+    while (musicQueue.length > 0) {
+      const next = musicQueue.shift()!;
+      musicCurrentTrack = next;
+      const connection = getVoiceConnection(DISCORD_GUILD_ID);
+      if (!connection || connection.state.status !== VoiceConnectionStatus.Ready) {
+        musicQueue.unshift(next);
+        musicCurrentTrack = null;
+        musicLastError = 'ClubEZ is not connected to a ready voice channel. Use /join or select Connect Bot in the dashboard.';
+        return;
+      }
+      try {
+        const input = await play.stream(next.url);
+        const resource = createAudioResource(input.stream, {
+          inputType: input.type,
+          inlineVolume: true,
+          metadata: next,
         });
-
-        if (results.length >= limit) break;
+        resource.volume?.setVolume(musicVolume / 100);
+        musicCurrentResource = resource;
+        connection.subscribe(musicPlayer);
+        musicLastError = null;
+        musicPlayer.play(resource);
+        console.log(`[MUSIC] Playing "${next.title}" in voice channel ${connection.joinConfig.channelId}`);
+        return;
+      } catch (error: any) {
+        musicLastError = `Could not play "${next.title}": ${error.message}`;
+        console.error('[MUSIC STREAM ERROR]', musicLastError);
+        musicCurrentTrack = null;
+        musicCurrentResource = null;
       }
     }
-    return results;
-  } catch (err: any) {
-    console.error('[YT SEARCH ERROR]', err.message);
-    return [];
+    musicCurrentTrack = null;
+    musicIsPlaying = false;
+    musicCurrentResource = null;
+  } finally {
+    musicIsLoading = false;
   }
 }
 
-// Summon ClubEZ bot physically into Discord Voice Channel
-function joinVoice(guild: any, channelId: string) {
-  try {
-    const existing = getVoiceConnection(guild.id);
-    if (existing && existing.joinConfig.channelId === channelId) {
-      musicVcChannelId = channelId;
-      return existing;
-    }
-    const connection = joinVoiceChannel({
+async function advanceMusicQueue(): Promise<void> {
+  const finished = musicCurrentTrack;
+  if (!finished) return;
+  if (musicLoopMode === 'track') {
+    musicQueue.unshift(finished);
+  } else if (musicLoopMode === 'queue') {
+    musicQueue.push(finished);
+  }
+  musicCurrentTrack = null;
+  musicCurrentResource = null;
+  await startNextMusicTrack();
+}
+
+async function enqueueMusicTrack(track: MusicQueueItem): Promise<{ position: number; started: boolean }> {
+  const startsNow = !musicCurrentTrack && !musicIsLoading;
+  musicQueue.push(track);
+  if (startsNow) await startNextMusicTrack();
+  const started = musicCurrentTrack?.id === track.id && musicIsPlaying;
+  return { position: started ? 0 : musicQueue.findIndex((item) => item.id === track.id) + 1, started };
+}
+
+function skipMusicTrack(): MusicQueueItem | null {
+  const skipped = musicCurrentTrack;
+  musicCurrentTrack = null;
+  musicCurrentResource = null;
+  if (musicPlayer.state.status !== AudioPlayerStatus.Idle) musicPlayer.stop(true);
+  void startNextMusicTrack();
+  return skipped;
+}
+
+function stopMusicPlayback() {
+  musicCurrentTrack = null;
+  musicCurrentResource = null;
+  musicQueue = [];
+  musicIsPlaying = false;
+  musicLastError = null;
+  if (musicPlayer.state.status !== AudioPlayerStatus.Idle) musicPlayer.stop(true);
+}
+
+// Summon ClubEZ into a voice channel and wait for Discord's Ready handshake.
+async function joinVoice(guild: any, channelId: string) {
+  const channel = guild?.channels.cache.get(channelId);
+  if (!channel || channel.type !== ChannelType.GuildVoice) throw new Error('Voice channel was not found in this server.');
+  const botMember = guild.members.me || (discordBot.user && guild.members.cache.get(discordBot.user.id));
+  const permissions = botMember ? channel.permissionsFor(botMember) : null;
+  if (!permissions?.has([PermissionFlagsBits.Connect, PermissionFlagsBits.Speak])) {
+    throw new Error('ClubEZ needs Connect and Speak permissions in that voice channel.');
+  }
+
+  let connection = getVoiceConnection(guild.id);
+  if (connection && connection.joinConfig.channelId !== channelId) {
+    connection.destroy();
+    connection = undefined;
+  }
+  if (!connection) {
+    connection = joinVoiceChannel({
       channelId,
       guildId: guild.id,
       adapterCreator: guild.voiceAdapterCreator,
       selfDeaf: false,
       selfMute: false,
     });
-    musicVcChannelId = channelId;
-    console.log(`[DISCORD VC] 🔊 ClubEZ physically connected to Voice Channel <#${channelId}>!`);
-    return connection;
-  } catch (err: any) {
-    console.error('[VOICE JOIN ERROR]', err.message);
-    return null;
   }
+
+  connection.subscribe(musicPlayer);
+  await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+  musicVcChannelId = channelId;
+  console.log(`[DISCORD VC] ClubEZ ready in #${channel.name}`);
+  return connection;
 }
 
-// Disconnect ClubEZ bot from Voice Channel
 function leaveVoice(guildId: string) {
-  try {
-    const conn = getVoiceConnection(guildId);
-    if (conn) {
-      conn.destroy();
-      console.log(`[DISCORD VC] 🔌 ClubEZ disconnected from Voice Channel in guild ${guildId}`);
-    }
-  } catch (err: any) {
-    console.error('[VOICE LEAVE ERROR]', err.message);
-  }
+  stopMusicPlayback();
+  const connection = getVoiceConnection(guildId);
+  if (connection) connection.destroy();
   musicVcChannelId = null;
-  musicIsPlaying = false;
-  musicCurrentTrack = null;
-  musicQueue = [];
+}
+
+async function handleMusicTextCommand(message: Message, text: string): Promise<boolean> {
+  const match = text.trim().match(/^([!./])(play|join|leave|skip|pause|stop|queue|nowplaying|volume)\b\s*(.*)$/i);
+  if (!match) return false;
+
+  const command = match[2].toLowerCase();
+  const args = (match[3] || '').trim();
+  const guild = message.guild;
+  const voiceChannel = message.member?.voice?.channel;
+
+  try {
+    if (!guild) {
+      await message.reply('Music commands only work inside the Club EZKEN server.');
+      return true;
+    }
+
+    if (command === 'join') {
+      if (!voiceChannel) {
+        await message.reply('Join a voice channel first, then type `!join`.');
+        return true;
+      }
+      await joinVoice(guild, voiceChannel.id);
+      await message.reply(`🔊 ClubEZ joined **${voiceChannel.name}**. Use \`!play <song or URL>\`.`);
+      return true;
+    }
+
+    if (command === 'leave' || command === 'stop') {
+      leaveVoice(guild.id);
+      await message.reply('⏹ Music stopped, queue cleared, and ClubEZ left voice.');
+      return true;
+    }
+
+    if (command === 'skip') {
+      const skipped = skipMusicTrack();
+      await message.reply(skipped ? `⏭ Skipped **${skipped.title}**.` : 'Nothing is playing right now.');
+      return true;
+    }
+
+    if (command === 'pause') {
+      if (!musicCurrentTrack) {
+        await message.reply('Nothing is playing right now.');
+        return true;
+      }
+      const resume = musicPlayer.state.status === AudioPlayerStatus.Paused;
+      if (resume) musicPlayer.unpause();
+      else if (musicPlayer.state.status === AudioPlayerStatus.Playing) musicPlayer.pause();
+      musicIsPlaying = resume;
+      await message.reply(resume ? '▶️ Resumed.' : '⏸ Paused.');
+      return true;
+    }
+
+    if (command === 'queue') {
+      const queueText = musicQueue.slice(0, 10).map((track, index) => `${index + 1}. ${track.title} — ${track.requestedBy}`).join('\n');
+      await message.reply(`${musicCurrentTrack ? `🎵 **Now:** ${musicCurrentTrack.title}\n` : ''}${queueText ? `📋 **Queue:**\n${queueText}` : '📋 Queue is empty.'}`);
+      return true;
+    }
+
+    if (command === 'nowplaying') {
+      await message.reply(musicCurrentTrack ? `🎵 Now playing: **${musicCurrentTrack.title}** — ${musicCurrentTrack.artist}` : 'Nothing is playing right now.');
+      return true;
+    }
+
+    if (command === 'volume') {
+      const level = Number(args);
+      if (!Number.isFinite(level) || level < 0 || level > 100) {
+        await message.reply('Use `!volume 0-100`.');
+        return true;
+      }
+      musicVolume = level;
+      if (musicCurrentResource?.volume) musicCurrentResource.volume.setVolume(level / 100);
+      await message.reply(`🔊 Volume set to **${level}%**.`);
+      return true;
+    }
+
+    if (command === 'play') {
+      if (!args) {
+        await message.reply('Use `!play <song name or YouTube/Spotify URL>`.');
+        return true;
+      }
+      if (!voiceChannel) {
+        await message.reply('Join a voice channel first, then type `!play <song>`.');
+        return true;
+      }
+      const loading = await message.reply(`🔎 Searching for **${args.slice(0, 120)}**...`);
+      await joinVoice(guild, voiceChannel.id);
+      const found = (await searchYouTube(args, 1))[0];
+      if (!found) {
+        await loading.edit('No playable YouTube result found. Try a different title or link.');
+        return true;
+      }
+      const track = { ...found, requestedBy: message.author.username, addedAt: Date.now() };
+      const queued = await enqueueMusicTrack(track);
+      const embed = new EmbedBuilder()
+        .setTitle(queued.position === 0 ? '🎵 Now Playing' : '📋 Added to Queue')
+        .setColor(0xE50914)
+        .setDescription(`**[${track.title}](${track.url})**\n🎤 ${track.artist}\n⏱️ ${track.duration}\n🔊 Voice: **${voiceChannel.name}**`)
+        .setThumbnail(track.thumbnail)
+        .addFields(
+          { name: 'Requested by', value: `<@${message.author.id}>`, inline: true },
+          { name: 'Queue Position', value: queued.position === 0 ? 'Now playing' : `#${queued.position}`, inline: true },
+          { name: 'Player', value: musicLastError ? `⚠️ ${musicLastError}` : musicPlayer.state.status, inline: true },
+        )
+        .setFooter({ text: 'Club EZKEN DJ System • !skip !pause !stop !queue' })
+        .setTimestamp();
+      await loading.edit({ content: '', embeds: [embed] });
+      return true;
+    }
+  } catch (error: any) {
+    console.error('[MUSIC TEXT COMMAND ERROR]', error?.stack || error?.message || error);
+    await message.reply(`❌ Music error: ${error.message || 'unknown error'}`).catch(() => {});
+    return true;
+  }
+
+  return true;
 }
 
 discordBot.on(Events.InteractionCreate, async (interaction) => {
@@ -442,8 +652,8 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
           await interaction.reply({ content: '❌ You must join a voice channel first before summoning ClubEZ!', ephemeral: true });
           return;
         }
-        joinVoice(interaction.guild, vcChannel.id);
-        await interaction.reply({ content: `🔊 **ClubEZ connected to <#${vcChannel.id}>!** Use \`/play <song>\` to start playing music.`, ephemeral: false });
+        await joinVoice(interaction.guild, vcChannel.id);
+        await interaction.reply({ content: `🔊 **ClubEZ connected to <#${vcChannel.id}>!** Use \`/play <song>\` to start playback.`, ephemeral: false });
         return;
       }
 
@@ -469,53 +679,37 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
         }
 
         await interaction.deferReply();
+        await joinVoice(interaction.guild, vcChannel.id);
 
-        // 1. Physically join the user's voice channel!
-        joinVoice(interaction.guild, vcChannel.id);
-
-        // 2. Real YouTube / Spotify search
         const searchResults = await searchYouTube(query, 1);
         const matched = searchResults[0];
+        if (!matched) throw new Error('No playable result found. Try a different title or public YouTube link.');
 
-        const isSpotify = query.includes('spotify.com');
-        const newTrack: MusicQueueItem = matched ? {
+        const newTrack: MusicQueueItem = {
           ...matched,
           requestedBy: interaction.user.username,
           addedAt: Date.now(),
-        } : {
-          id: `track_${Date.now()}`,
-          title: query.startsWith('http') ? `🎵 ${query.substring(0, 60)}` : query,
-          artist: isSpotify ? 'Spotify' : 'YouTube Artist',
-          duration: '3:30',
-          thumbnail: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=500&auto=format&fit=crop&q=80',
-          url: query.startsWith('http') ? query : `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
-          source: isSpotify ? 'spotify' : 'youtube',
-          requestedBy: interaction.user.username,
-          addedAt: Date.now(),
         };
-
-        const isFirstTrack = !musicCurrentTrack;
-        if (isFirstTrack) {
-          musicCurrentTrack = newTrack;
-          musicIsPlaying = true;
-        } else {
-          musicQueue.push(newTrack);
-        }
+        const isFirstTrack = !musicCurrentTrack && musicQueue.length === 0;
+        const queued = await enqueueMusicTrack(newTrack);
+        const isSpotifyMatch = newTrack.source === 'spotify';
 
         const embed = new EmbedBuilder()
-          .setTitle(isFirstTrack ? '🎵 Now Playing' : '📋 Added to Queue')
+          .setTitle(queued.position === 0 ? '🎵 Starting Playback' : '📋 Added to Queue')
           .setColor(0xE50914)
           .setDescription(
             `**[${newTrack.title}](${newTrack.url})**\n\n` +
             `🎤 **Artist / Channel:** ${newTrack.artist}\n` +
             `⏱️ **Duration:** \`${newTrack.duration}\`\n\n` +
-            `🔊 **Playing in:** <#${vcChannel.id}> (${vcChannel.name})`
+            `🔊 **Voice channel:** <#${vcChannel.id}>\n` +
+            (isSpotifyMatch ? 'ℹ️ Spotify track identified; playback uses its YouTube match.\n' : '') +
+            (musicLastError ? `⚠️ ${musicLastError}` : '')
           )
           .setThumbnail(newTrack.thumbnail)
           .addFields(
-            { name: isSpotify ? '🎶 Spotify' : '▶️ YouTube', value: `[Watch / Listen](${newTrack.url})`, inline: true },
+            { name: '🔎 Found via', value: isSpotifyMatch ? 'Spotify link → YouTube match' : 'YouTube', inline: true },
             { name: '👤 Requested by', value: `<@${interaction.user.id}>`, inline: true },
-            { name: '📋 Queue', value: `${musicQueue.length} song${musicQueue.length !== 1 ? 's' : ''} remaining`, inline: true },
+            { name: '📋 Position', value: queued.position === 0 ? 'Now playing' : `#${queued.position}`, inline: true },
           )
           .setFooter({ text: 'Club EZKEN DJ System • /skip /pause /stop /queue /volume' })
           .setTimestamp();
@@ -533,28 +727,14 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
 
       // /skip
       if (commandName === 'skip') {
-        const prev = musicCurrentTrack;
+        const prev = skipMusicTrack();
         if (!prev) {
           await interaction.reply({ content: '❌ Nothing is playing right now.', ephemeral: true });
           return;
         }
-        if (musicQueue.length > 0) {
-          musicCurrentTrack = musicQueue.shift() || null;
-          musicIsPlaying = true;
-        } else {
-          musicCurrentTrack = null;
-          musicIsPlaying = false;
-        }
-        const embed = new EmbedBuilder()
-          .setTitle('⏭ Track Skipped')
-          .setColor(0xFBBF24)
-          .setDescription(
-            `Skipped **${prev.title}**\n\n` +
-            (musicCurrentTrack ? `🎵 Now Playing: **${musicCurrentTrack.title}**` : '✅ Queue is now empty.')
-          )
-          .setFooter({ text: 'Club EZKEN DJ System' })
-          .setTimestamp();
-        await interaction.reply({ embeds: [embed] });
+        await interaction.reply({
+          content: `⏭ Skipped **${prev.title}**. ${musicCurrentTrack ? `Starting **${musicCurrentTrack.title}**.` : 'The queue is empty.'}`,
+        });
         return;
       }
 
@@ -564,7 +744,14 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
           await interaction.reply({ content: '❌ Nothing is playing right now.', ephemeral: true });
           return;
         }
-        musicIsPlaying = !musicIsPlaying;
+        const isPaused = musicPlayer.state.status === AudioPlayerStatus.Paused;
+        if (isPaused) musicPlayer.unpause();
+        else if (musicPlayer.state.status === AudioPlayerStatus.Playing) musicPlayer.pause();
+        else {
+          await interaction.reply({ content: '⏳ Playback is not ready yet.', ephemeral: true });
+          return;
+        }
+        musicIsPlaying = isPaused;
         const embed = new EmbedBuilder()
           .setTitle(musicIsPlaying ? '▶️ Resumed' : '⏸ Paused')
           .setColor(musicIsPlaying ? 0x10B981 : 0xFBBF24)
@@ -650,6 +837,7 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
       if (commandName === 'volume') {
         const level = interaction.options.getInteger('level', true);
         musicVolume = level;
+        if (musicCurrentResource?.volume) musicCurrentResource.volume.setVolume(level / 100);
         const embed = new EmbedBuilder()
           .setTitle('🔊 Volume Updated')
           .setColor(0x2ea8ff)
@@ -814,18 +1002,22 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
     const action = interaction.customId.split(':')[1];
     try {
       if (action === 'pause') {
-        musicIsPlaying = !musicIsPlaying;
-        await interaction.reply({ content: musicIsPlaying ? '▶️ Music resumed!' : '⏸ Music paused!', ephemeral: true });
-      } else if (action === 'skip') {
-        const prev = musicCurrentTrack?.title || 'current track';
-        if (musicQueue.length > 0) {
-          musicCurrentTrack = musicQueue.shift() || null;
-          musicIsPlaying = true;
-        } else {
-          musicCurrentTrack = null;
-          musicIsPlaying = false;
+        if (!musicCurrentTrack) {
+          await interaction.reply({ content: 'Nothing is playing right now.', ephemeral: true });
+          return;
         }
-        await interaction.reply({ content: `⏭ Skipped **${prev}**!${musicCurrentTrack ? ` Now playing **${musicCurrentTrack.title}**` : ' Queue is empty.'}`, ephemeral: true });
+        const resume = musicPlayer.state.status === AudioPlayerStatus.Paused;
+        if (resume) musicPlayer.unpause();
+        else if (musicPlayer.state.status === AudioPlayerStatus.Playing) musicPlayer.pause();
+        else {
+          await interaction.reply({ content: 'Playback is still loading.', ephemeral: true });
+          return;
+        }
+        musicIsPlaying = resume;
+        await interaction.reply({ content: resume ? '▶️ Music resumed!' : '⏸ Music paused!', ephemeral: true });
+      } else if (action === 'skip') {
+        const prev = skipMusicTrack();
+        await interaction.reply({ content: prev ? `⏭ Skipped **${prev.title}**.${musicCurrentTrack ? ` Now playing **${musicCurrentTrack.title}**` : ' Queue is empty.'}` : 'Nothing is playing right now.', ephemeral: true });
       } else if (action === 'stop') {
         leaveVoice(interaction.guildId || DISCORD_GUILD_ID);
         await interaction.reply({ content: '⏹ Music stopped, queue cleared, and ClubEZ disconnected from VC.', ephemeral: true });
@@ -1348,6 +1540,9 @@ discordBot.on(Events.MessageCreate, async (message) => {
 
   const text = message.content || '';
   if (!text) return;
+
+  // Prefix music commands for members who type !play instead of Discord slash commands.
+  if (await handleMusicTextCommand(message, text)) return;
 
   // Auto-Moderation Evaluation Rules:
   const inviteRegex = /(https?:\/\/)?(www\.)?(discord\.(gg|io|me|li)|discord\.com\/invite)\/[a-zA-Z0-9-]+/gi;
@@ -4355,13 +4550,16 @@ app.get('/api/music/status', (_req: Request, res: Response) => {
     })) || [];
 
   return res.json({
-    isPlaying: musicIsPlaying,
+    isPlaying: musicPlayer.state.status === AudioPlayerStatus.Playing,
+    playerStatus: musicPlayer.state.status,
     currentTrack: musicCurrentTrack,
+    playbackPositionSec: musicCurrentResource ? Math.floor(musicCurrentResource.playbackDuration / 1000) : 0,
     queue: musicQueue,
     volume: musicVolume,
     loop: musicLoopMode,
     shuffle: musicShuffleEnabled,
-    botInVc: !!conn,
+    lastError: musicLastError,
+    botInVc: !!conn && conn.state.status === VoiceConnectionStatus.Ready,
     connectedVc: connectedChan ? {
       id: connectedChan.id,
       name: connectedChan.name,
@@ -4398,12 +4596,13 @@ app.post(['/api/music/connect', '/api/music/join'], async (req: Request, res: Re
       return res.status(400).json({ error: 'Specified channel is not a voice channel' });
     }
 
-    joinVoice(guild, channelId);
+    const connection = await joinVoice(guild, channelId);
 
     return res.json({
       success: true,
       channelId,
       channelName: chan.name,
+      connectionStatus: connection.state.status,
       message: `ClubEZ connected to Voice Channel #${chan.name}!`,
     });
   } catch (err: any) {
@@ -4417,114 +4616,99 @@ app.post(['/api/music/disconnect', '/api/music/leave'], (_req: Request, res: Res
   return res.json({ success: true, message: 'ClubEZ disconnected from voice channel.' });
 });
 
-// POST /api/music/play - Add track to queue and start playing
+// POST /api/music/play - Resolve/queue a real track and stream it to Discord voice
 app.post('/api/music/play', async (req: Request, res: Response) => {
-  const { query, requestedBy = 'KEN', channelId } = req.body;
-  if (!query) return res.status(400).json({ error: 'query required' });
+  const { query, track: selectedTrack, requestedBy = 'Dashboard', channelId } = req.body || {};
+  if (!selectedTrack && (typeof query !== 'string' || !query.trim())) {
+    return res.status(400).json({ error: 'Provide a search query or choose one of the search results.' });
+  }
 
   try {
     const guild = discordBot.guilds.cache.get(DISCORD_GUILD_ID);
+    if (!guild) return res.status(503).json({ error: 'Discord bot is not ready or the server is unavailable.' });
 
-    // Auto-connect to VC if channelId specified or if already known
-    const targetVcId = channelId || musicVcChannelId;
-    if (guild && targetVcId) {
-      joinVoice(guild, targetVcId);
+    const existing = getVoiceConnection(DISCORD_GUILD_ID);
+    const targetVcId = channelId || existing?.joinConfig.channelId;
+    if (!targetVcId) {
+      return res.status(400).json({ error: 'Select a voice channel and click Connect Bot first, or use /play while you are in voice.' });
     }
+    await joinVoice(guild, targetVcId);
 
-    // Live search YouTube/Spotify
-    const searchResults = await searchYouTube(query, 1);
-    const matched = searchResults[0];
-
-    const isSpotify = query.includes('spotify.com');
-    const newTrack: MusicQueueItem = matched ? {
-      ...matched,
-      requestedBy,
-      addedAt: Date.now(),
-    } : {
-      id: `track_${Date.now()}`,
-      title: query,
-      artist: isSpotify ? 'Spotify' : 'YouTube Artist',
-      duration: '3:30',
-      thumbnail: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=500&auto=format&fit=crop&q=80',
-      url: query.startsWith('http') ? query : `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
-      source: isSpotify ? 'spotify' : 'youtube',
-      requestedBy,
-      addedAt: Date.now(),
-    };
-
-    if (!musicCurrentTrack) {
-      musicCurrentTrack = newTrack;
-      musicIsPlaying = true;
-    } else {
-      musicQueue.push(newTrack);
-    }
-
-    // Post rich update embed to a text channel in Discord
-    if (guild && targetVcId) {
-      const vcChan = guild.channels.cache.get(targetVcId);
-      const textChan = guild.channels.cache.find((c: any) =>
-        c.type === 0 && (c.parentId === (vcChan as any)?.parentId || c.name.includes('music') || c.name.includes('bot') || c.name.includes('general'))
-      ) as TextChannel | undefined;
-
-      if (textChan) {
-        const embed = new EmbedBuilder()
-          .setTitle(musicCurrentTrack?.id === newTrack.id ? '🎵 Now Playing' : '📋 Added to Queue')
-          .setColor(0xE50914)
-          .setDescription(`**[${newTrack.title}](${newTrack.url})**\n🎤 **Artist:** ${newTrack.artist}\n⏱️ **Duration:** \`${newTrack.duration}\``)
-          .setThumbnail(newTrack.thumbnail)
-          .addFields(
-            { name: '📡 Source', value: newTrack.source, inline: true },
-            { name: '👤 Requested by', value: requestedBy, inline: true },
-            { name: '📋 Queue', value: `${musicQueue.length} song${musicQueue.length !== 1 ? 's' : ''} waiting`, inline: true }
-          )
-          .setFooter({ text: 'Club EZKEN DJ System • Controlled via Dashboard' })
-          .setTimestamp();
-
-        const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder().setCustomId('music:pause').setLabel('⏸ Pause').setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder().setCustomId('music:skip').setLabel('⏭ Skip').setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder().setCustomId('music:stop').setLabel('⏹ Stop & Leave').setStyle(ButtonStyle.Danger),
-          new ButtonBuilder().setCustomId('music:queue_btn').setLabel('📋 Queue').setStyle(ButtonStyle.Primary),
-        );
-
-        await textChan.send({ embeds: [embed], components: [row] }).catch(() => { });
+    let newTrack: MusicQueueItem;
+    if (selectedTrack) {
+      const url = String(selectedTrack.url || '');
+      const hostname = (() => { try { return new URL(url).hostname.toLowerCase(); } catch { return ''; } })();
+      if (!(hostname === 'youtu.be' || hostname.endsWith('youtube.com'))) {
+        return res.status(400).json({ error: 'This result is not a playable YouTube video. Search again and choose a YouTube result.' });
       }
+      newTrack = {
+        id: String(selectedTrack.id || `track_${Date.now()}`),
+        title: String(selectedTrack.title || 'YouTube track'),
+        artist: String(selectedTrack.artist || 'YouTube'),
+        duration: String(selectedTrack.duration || 'Unknown'),
+        durationSec: Number(selectedTrack.durationSec) || 0,
+        thumbnail: String(selectedTrack.thumbnail || ''),
+        url,
+        source: selectedTrack.source === 'spotify' ? 'spotify' : 'youtube',
+        requestedBy: String(requestedBy).slice(0, 80),
+        addedAt: Date.now(),
+      };
+    } else {
+      const found = (await searchYouTube(query.trim(), 1))[0];
+      if (!found) return res.status(404).json({ error: 'No playable result found. Try a different title or public YouTube link.' });
+      newTrack = { ...found, requestedBy: String(requestedBy).slice(0, 80), addedAt: Date.now() };
     }
 
+    const queued = await enqueueMusicTrack(newTrack);
     return res.json({
       success: true,
+      message: queued.position === 0 ? 'Playback started.' : `Added at queue position ${queued.position}.`,
       track: newTrack,
-      queuePosition: musicCurrentTrack?.id === newTrack.id ? 0 : musicQueue.length,
-      queue: musicQueue,
+      queuePosition: queued.position,
+      playerStatus: musicPlayer.state.status,
+      lastError: musicLastError,
     });
   } catch (err: any) {
-    return res.status(500).json({ error: err.message });
+    console.error('[MUSIC PLAY API ERROR]', err?.stack || err?.message || err);
+    return res.status(500).json({ error: err.message || 'Unable to start music playback.' });
   }
 });
 
-// POST /api/music/skip - Skip current track
+// POST /api/music/skip - Skip the active resource and start the next queued track
 app.post('/api/music/skip', (_req: Request, res: Response) => {
-  const prev = musicCurrentTrack;
-  if (musicQueue.length > 0) {
-    musicCurrentTrack = musicQueue.shift() || null;
-    musicIsPlaying = true;
-  } else {
-    musicCurrentTrack = null;
-    musicIsPlaying = false;
-  }
-  return res.json({ success: true, skipped: prev, nowPlaying: musicCurrentTrack, queue: musicQueue });
+  const skipped = skipMusicTrack();
+  if (!skipped) return res.status(409).json({ error: 'Nothing is playing right now.' });
+  return res.json({ success: true, skipped, currentTrack: musicCurrentTrack, queue: musicQueue });
 });
 
-// POST /api/music/pause - Toggle pause
-app.post('/api/music/pause', (_req: Request, res: Response) => {
-  musicIsPlaying = !musicIsPlaying;
-  return res.json({ success: true, isPlaying: musicIsPlaying });
+// POST /api/music/pause - Set actual audio player pause/resume state
+app.post('/api/music/pause', (req: Request, res: Response) => {
+  if (!musicCurrentTrack) return res.status(409).json({ error: 'Nothing is playing right now.' });
+  const shouldPlay = typeof req.body?.isPlaying === 'boolean'
+    ? req.body.isPlaying
+    : musicPlayer.state.status === AudioPlayerStatus.Paused;
+  if (shouldPlay && musicPlayer.state.status === AudioPlayerStatus.Paused) musicPlayer.unpause();
+  if (!shouldPlay && musicPlayer.state.status === AudioPlayerStatus.Playing) musicPlayer.pause();
+  musicIsPlaying = shouldPlay;
+  return res.json({ success: true, isPlaying: shouldPlay, playerStatus: musicPlayer.state.status });
 });
 
 // POST /api/music/stop - Stop music, clear queue & leave VC
 app.post('/api/music/stop', (_req: Request, res: Response) => {
   leaveVoice(DISCORD_GUILD_ID);
   return res.json({ success: true, message: 'Music stopped and ClubEZ disconnected from voice.' });
+});
+
+// POST /api/music/restart - Restart the current track from the beginning
+app.post('/api/music/restart', async (_req: Request, res: Response) => {
+  const current = musicCurrentTrack;
+  if (!current) return res.status(409).json({ error: 'Nothing is playing right now.' });
+  musicQueue.unshift(current);
+  musicCurrentTrack = null;
+  musicCurrentResource = null;
+  if (musicPlayer.state.status !== AudioPlayerStatus.Idle) musicPlayer.stop(true);
+  await startNextMusicTrack();
+  return res.json({ success: true, currentTrack: musicCurrentTrack, playerStatus: musicPlayer.state.status, lastError: musicLastError });
 });
 
 // POST /api/music/remove - Remove song by ID or index
@@ -4551,6 +4735,7 @@ app.post('/api/music/volume', (req: Request, res: Response) => {
     return res.status(400).json({ error: 'Volume must be 0-100' });
   }
   musicVolume = volume;
+  if (musicCurrentResource?.volume) musicCurrentResource.volume.setVolume(volume / 100);
   return res.json({ success: true, volume });
 });
 
