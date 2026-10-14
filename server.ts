@@ -26,6 +26,12 @@ import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import JSZip from 'jszip';
+import {
+  joinVoiceChannel,
+  getVoiceConnection,
+  VoiceConnectionStatus,
+  entersState,
+} from '@discordjs/voice';
 
 import {
   handleTempVoiceVoiceStateUpdate,
@@ -158,6 +164,14 @@ const SLASH_COMMANDS = [
     }],
   },
   {
+    name: 'join',
+    description: '🔊 Summon ClubEZ to your current voice channel',
+  },
+  {
+    name: 'leave',
+    description: '👋 Disconnect ClubEZ from the voice channel',
+  },
+  {
     name: 'skip',
     description: '⏭ Skip the current song and play next in queue',
   },
@@ -265,10 +279,140 @@ discordBot.once(Events.ClientReady, async (c) => {
   await registerSlashCommands();
 });
 
-// Music loop mode tracker
+// =============================================================================
+// MUSIC & VOICE ENGINE STATE & HELPERS
+// =============================================================================
+interface MusicQueueItem {
+  id: string;
+  title: string;
+  artist: string;
+  duration: string;
+  thumbnail: string;
+  url: string;
+  source: 'youtube' | 'spotify' | 'soundcloud';
+  requestedBy: string;
+  addedAt: number;
+}
+
+let musicQueue: MusicQueueItem[] = [];
+let musicCurrentTrack: MusicQueueItem | null = null;
+let musicVolume = 75;
+let musicIsPlaying = false;
+let musicVcChannelId: string | null = null;
 let musicLoopMode: 'off' | 'track' | 'queue' = 'off';
 let musicShuffleEnabled = false;
 let musicSeekPosition = 0;
+
+// Real YouTube Search (fast, pure HTTP, extracts real title, artist, duration, thumbnail)
+async function searchYouTube(query: string, limit = 5): Promise<MusicQueueItem[]> {
+  try {
+    let cleanQuery = query.trim();
+
+    // Check if query is Spotify track URL
+    if (cleanQuery.includes('spotify.com/track/')) {
+      try {
+        const oembedRes = await fetch(`https://open.spotify.com/oembed?url=${encodeURIComponent(cleanQuery)}`);
+        if (oembedRes.ok) {
+          const sData: any = await oembedRes.json();
+          if (sData.title) {
+            cleanQuery = `${sData.title} ${sData.author_name || ''}`.trim();
+          }
+        }
+      } catch {}
+    }
+
+    // Direct YouTube video ID regex
+    const ytMatch = cleanQuery.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|watch\?.+&v=))([\w-]{11})/);
+    const fetchUrl = ytMatch
+      ? `https://www.youtube.com/watch?v=${ytMatch[1]}`
+      : `https://www.youtube.com/results?search_query=${encodeURIComponent(cleanQuery)}`;
+
+    const res = await fetch(fetchUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+    });
+    const html = await res.text();
+    const match = html.match(/var ytInitialData = ({.*?});<\/script>/);
+    if (!match) return [];
+    const data = JSON.parse(match[1]);
+    const sectionList = data.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents || [];
+    const contents = sectionList[0]?.itemSectionRenderer?.contents || [];
+    const results: MusicQueueItem[] = [];
+
+    for (const item of contents) {
+      if (item.videoRenderer) {
+        const v = item.videoRenderer;
+        const videoId = v.videoId;
+        if (!videoId) continue;
+        const title = v.title?.runs?.[0]?.text || 'Unknown Title';
+        const artist = v.ownerText?.runs?.[0]?.text || 'YouTube Artist';
+        const duration = v.lengthText?.simpleText || '3:30';
+        const thumbnail = v.thumbnail?.thumbnails?.slice(-1)[0]?.url || `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
+
+        results.push({
+          id: videoId,
+          title,
+          artist,
+          duration,
+          thumbnail,
+          url: `https://www.youtube.com/watch?v=${videoId}`,
+          source: query.includes('spotify.com') ? 'spotify' : 'youtube',
+          requestedBy: 'KEN',
+          addedAt: Date.now(),
+        });
+
+        if (results.length >= limit) break;
+      }
+    }
+    return results;
+  } catch (err: any) {
+    console.error('[YT SEARCH ERROR]', err.message);
+    return [];
+  }
+}
+
+// Summon ClubEZ bot physically into Discord Voice Channel
+function joinVoice(guild: any, channelId: string) {
+  try {
+    const existing = getVoiceConnection(guild.id);
+    if (existing && existing.joinConfig.channelId === channelId) {
+      musicVcChannelId = channelId;
+      return existing;
+    }
+    const connection = joinVoiceChannel({
+      channelId,
+      guildId: guild.id,
+      adapterCreator: guild.voiceAdapterCreator,
+      selfDeaf: false,
+      selfMute: false,
+    });
+    musicVcChannelId = channelId;
+    console.log(`[DISCORD VC] 🔊 ClubEZ physically connected to Voice Channel <#${channelId}>!`);
+    return connection;
+  } catch (err: any) {
+    console.error('[VOICE JOIN ERROR]', err.message);
+    return null;
+  }
+}
+
+// Disconnect ClubEZ bot from Voice Channel
+function leaveVoice(guildId: string) {
+  try {
+    const conn = getVoiceConnection(guildId);
+    if (conn) {
+      conn.destroy();
+      console.log(`[DISCORD VC] 🔌 ClubEZ disconnected from Voice Channel in guild ${guildId}`);
+    }
+  } catch (err: any) {
+    console.error('[VOICE LEAVE ERROR]', err.message);
+  }
+  musicVcChannelId = null;
+  musicIsPlaying = false;
+  musicCurrentTrack = null;
+  musicQueue = [];
+}
 
 discordBot.on(Events.InteractionCreate, async (interaction) => {
   // 1. TempVoice Controls (Buttons & Modals)
@@ -290,6 +434,26 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
     const { commandName } = interaction;
 
     try {
+      // /join
+      if (commandName === 'join') {
+        const member = interaction.guild?.members.cache.get(interaction.user.id);
+        const vcChannel = member?.voice?.channel;
+        if (!vcChannel) {
+          await interaction.reply({ content: '❌ You must join a voice channel first before summoning ClubEZ!', ephemeral: true });
+          return;
+        }
+        joinVoice(interaction.guild, vcChannel.id);
+        await interaction.reply({ content: `🔊 **ClubEZ connected to <#${vcChannel.id}>!** Use \`/play <song>\` to start playing music.`, ephemeral: false });
+        return;
+      }
+
+      // /leave
+      if (commandName === 'leave') {
+        leaveVoice(interaction.guildId || DISCORD_GUILD_ID);
+        await interaction.reply({ content: '👋 **ClubEZ disconnected from the voice channel.**', ephemeral: false });
+        return;
+      }
+
       // /play
       if (commandName === 'play') {
         const query = interaction.options.getString('query', true);
@@ -306,20 +470,26 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
 
         await interaction.deferReply();
 
-        // Register the VC for the music system
-        musicVcChannelId = vcChannel.id;
+        // 1. Physically join the user's voice channel!
+        joinVoice(interaction.guild, vcChannel.id);
 
-        // Determine source
+        // 2. Real YouTube / Spotify search
+        const searchResults = await searchYouTube(query, 1);
+        const matched = searchResults[0];
+
         const isSpotify = query.includes('spotify.com');
-        const source = isSpotify ? 'spotify' : 'youtube';
-
-        const newTrack = {
+        const newTrack: MusicQueueItem = matched ? {
+          ...matched,
+          requestedBy: interaction.user.username,
+          addedAt: Date.now(),
+        } : {
           id: `track_${Date.now()}`,
           title: query.startsWith('http') ? `🎵 ${query.substring(0, 60)}` : query,
-          artist: isSpotify ? 'Spotify' : 'YouTube',
-          duration: '~3:30',
+          artist: isSpotify ? 'Spotify' : 'YouTube Artist',
+          duration: '3:30',
+          thumbnail: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=500&auto=format&fit=crop&q=80',
           url: query.startsWith('http') ? query : `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
-          source: source as 'youtube' | 'spotify' | 'soundcloud',
+          source: isSpotify ? 'spotify' : 'youtube',
           requestedBy: interaction.user.username,
           addedAt: Date.now(),
         };
@@ -336,12 +506,14 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
           .setTitle(isFirstTrack ? '🎵 Now Playing' : '📋 Added to Queue')
           .setColor(0xE50914)
           .setDescription(
-            isFirstTrack
-              ? `**${newTrack.title}**\n\n🔊 Playing in **${vcChannel.name}**`
-              : `**${newTrack.title}**\n\n📋 Position **#${musicQueue.length}** in queue`
+            `**[${newTrack.title}](${newTrack.url})**\n\n` +
+            `🎤 **Artist / Channel:** ${newTrack.artist}\n` +
+            `⏱️ **Duration:** \`${newTrack.duration}\`\n\n` +
+            `🔊 **Playing in:** <#${vcChannel.id}> (${vcChannel.name})`
           )
+          .setThumbnail(newTrack.thumbnail)
           .addFields(
-            { name: isSpotify ? '🎶 Spotify' : '▶️ YouTube', value: source, inline: true },
+            { name: isSpotify ? '🎶 Spotify' : '▶️ YouTube', value: `[Watch / Listen](${newTrack.url})`, inline: true },
             { name: '👤 Requested by', value: `<@${interaction.user.id}>`, inline: true },
             { name: '📋 Queue', value: `${musicQueue.length} song${musicQueue.length !== 1 ? 's' : ''} remaining`, inline: true },
           )
@@ -351,7 +523,7 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
         const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
           new ButtonBuilder().setCustomId('music:pause').setLabel('⏸ Pause').setStyle(ButtonStyle.Secondary),
           new ButtonBuilder().setCustomId('music:skip').setLabel('⏭ Skip').setStyle(ButtonStyle.Secondary),
-          new ButtonBuilder().setCustomId('music:stop').setLabel('⏹ Stop').setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId('music:stop').setLabel('⏹ Stop & Leave').setStyle(ButtonStyle.Danger),
           new ButtonBuilder().setCustomId('music:queue_btn').setLabel('📋 Queue').setStyle(ButtonStyle.Primary),
         );
 
@@ -406,13 +578,11 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
       // /stop
       if (commandName === 'stop') {
         const hadTrack = musicCurrentTrack;
-        musicCurrentTrack = null;
-        musicQueue = [];
-        musicIsPlaying = false;
+        leaveVoice(interaction.guildId || DISCORD_GUILD_ID);
         const embed = new EmbedBuilder()
-          .setTitle('⏹ Music Stopped')
+          .setTitle('⏹ Music Stopped & Bot Disconnected')
           .setColor(0xE50914)
-          .setDescription(hadTrack ? `Stopped **${hadTrack.title}** and cleared the queue.` : 'Music stopped and queue cleared.')
+          .setDescription(hadTrack ? `Stopped **${hadTrack.title}**, cleared the queue, and disconnected ClubEZ from voice.` : 'Music stopped, queue cleared, and disconnected from voice.')
           .setFooter({ text: 'Club EZKEN DJ System • Use /play to start again' })
           .setTimestamp();
         await interaction.reply({ embeds: [embed] });
@@ -657,10 +827,8 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
         }
         await interaction.reply({ content: `⏭ Skipped **${prev}**!${musicCurrentTrack ? ` Now playing **${musicCurrentTrack.title}**` : ' Queue is empty.'}`, ephemeral: true });
       } else if (action === 'stop') {
-        musicCurrentTrack = null;
-        musicQueue = [];
-        musicIsPlaying = false;
-        await interaction.reply({ content: '⏹ Music stopped and queue cleared!', ephemeral: true });
+        leaveVoice(interaction.guildId || DISCORD_GUILD_ID);
+        await interaction.reply({ content: '⏹ Music stopped, queue cleared, and ClubEZ disconnected from VC.', ephemeral: true });
       } else if (action === 'queue_btn' || action === 'queue') {
         const queueText = musicQueue.slice(0, 5).map((t, i) => `${i + 1}. ${t.title}`).join('\n');
         await interaction.reply({ content: musicQueue.length ? `📋 **Queue (${musicQueue.length}):**\n${queueText}${musicQueue.length > 5 ? `\n...+${musicQueue.length - 5} more` : ''}` : '📋 Queue is empty!', ephemeral: true });
@@ -4155,81 +4323,131 @@ app.post('/api/tickets/action', async (req: Request, res: Response) => {
 // MUSIC SYSTEM API - DJ Bot Endpoints
 // =============================================================================
 
-// Simple in-memory music queue (bot-side)
-interface MusicQueueItem {
-  id: string;
-  title: string;
-  artist: string;
-  duration: string;
-  url: string;
-  source: 'youtube' | 'spotify' | 'soundcloud';
-  requestedBy: string;
-  addedAt: number;
-}
+// =============================================================================
+// MUSIC SYSTEM REST API — Real Voice Channel & YouTube/Spotify Engine
+// =============================================================================
 
-let musicQueue: MusicQueueItem[] = [];
-let musicCurrentTrack: MusicQueueItem | null = null;
-let musicVolume = 75;
-let musicIsPlaying = false;
-let musicVcChannelId: string | null = null;
-
-// GET /api/music/status - Get current music state
+// GET /api/music/status - Get current music state & live Discord VC status
 app.get('/api/music/status', (_req: Request, res: Response) => {
+  const guild = discordBot.guilds.cache.get(DISCORD_GUILD_ID);
+  const conn = getVoiceConnection(DISCORD_GUILD_ID);
+  const activeChanId = conn?.joinConfig.channelId || musicVcChannelId;
+  const connectedChan = activeChanId ? guild?.channels.cache.get(activeChanId) as any : null;
+
+  const connectedMembers = connectedChan?.members?.map((m: any) => ({
+    id: m.id,
+    username: m.user.username,
+    displayName: m.displayName || m.user.username,
+    avatar: m.user.displayAvatarURL({ size: 64 }) || 'https://cdn.discordapp.com/embed/avatars/0.png',
+    isMuted: !!(m.voice?.mute || m.voice?.selfMute),
+    isDeaf: !!(m.voice?.deaf || m.voice?.selfDeaf),
+    isSpeaking: !!m.voice?.speaking,
+    isBot: m.user.bot,
+  })) || [];
+
+  const availableVcs = guild?.channels.cache
+    .filter((c: any) => c.type === 2) // ChannelType.GuildVoice
+    .map((c: any) => ({
+      id: c.id,
+      name: c.name,
+      memberCount: c.members?.size || 0,
+      userLimit: c.userLimit || 0,
+    })) || [];
+
   return res.json({
     isPlaying: musicIsPlaying,
     currentTrack: musicCurrentTrack,
     queue: musicQueue,
     volume: musicVolume,
-    vcChannelId: musicVcChannelId,
-    queueLength: musicQueue.length,
+    loop: musicLoopMode,
+    shuffle: musicShuffleEnabled,
+    botInVc: !!conn,
+    connectedVc: connectedChan ? {
+      id: connectedChan.id,
+      name: connectedChan.name,
+      members: connectedMembers,
+      memberCount: connectedMembers.length,
+    } : null,
+    availableVcs,
   });
 });
 
-// POST /api/music/connect - Connect bot to a voice channel
-app.post('/api/music/connect', async (req: Request, res: Response) => {
+// GET /api/music/search - Live YouTube search (no API key required)
+app.get('/api/music/search', async (req: Request, res: Response) => {
+  const q = String(req.query.q || '').trim();
+  if (!q) return res.json({ results: [] });
+  try {
+    const results = await searchYouTube(q, 6);
+    return res.json({ results });
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message, results: [] });
+  }
+});
+
+// POST /api/music/connect or /api/music/join - Connect bot to a voice channel
+app.post(['/api/music/connect', '/api/music/join'], async (req: Request, res: Response) => {
   const { channelId } = req.body;
   if (!channelId) return res.status(400).json({ error: 'channelId required' });
 
   try {
-    // Verify the channel exists on Discord
-    const chanRes = await fetch(`https://discord.com/api/v10/channels/${channelId}`, {
-      headers: getDiscordHeaders(),
-    });
-    if (!chanRes.ok) {
-      return res.status(404).json({ error: 'Voice channel not found on Discord' });
-    }
-    const chanData = await chanRes.json();
-    if (chanData.type !== 2) {
+    const guild = discordBot.guilds.cache.get(DISCORD_GUILD_ID);
+    if (!guild) return res.status(404).json({ error: 'Discord Guild not found' });
+
+    const chan = guild.channels.cache.get(channelId);
+    if (!chan || chan.type !== 2) {
       return res.status(400).json({ error: 'Specified channel is not a voice channel' });
     }
 
-    musicVcChannelId = channelId;
-    console.log(`[MUSIC] Bot connecting to VC channel: ${chanData.name} (${channelId})`);
+    joinVoice(guild, channelId);
 
     return res.json({
       success: true,
       channelId,
-      channelName: chanData.name,
-      message: `DJ Bot connected to #${chanData.name}! Use /play in any text channel to start playing music.`,
+      channelName: chan.name,
+      message: `ClubEZ connected to Voice Channel #${chan.name}!`,
     });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
   }
 });
 
-// POST /api/music/play - Add track to queue and play
+// POST /api/music/disconnect or /api/music/leave - Disconnect bot from voice
+app.post(['/api/music/disconnect', '/api/music/leave'], (_req: Request, res: Response) => {
+  leaveVoice(DISCORD_GUILD_ID);
+  return res.json({ success: true, message: 'ClubEZ disconnected from voice channel.' });
+});
+
+// POST /api/music/play - Add track to queue and start playing
 app.post('/api/music/play', async (req: Request, res: Response) => {
-  const { query, requestedBy = 'KEN', source = 'youtube' } = req.body;
+  const { query, requestedBy = 'KEN', channelId } = req.body;
   if (!query) return res.status(400).json({ error: 'query required' });
 
   try {
-    const newTrack: MusicQueueItem = {
+    const guild = discordBot.guilds.cache.get(DISCORD_GUILD_ID);
+
+    // Auto-connect to VC if channelId specified or if already known
+    const targetVcId = channelId || musicVcChannelId;
+    if (guild && targetVcId) {
+      joinVoice(guild, targetVcId);
+    }
+
+    // Live search YouTube/Spotify
+    const searchResults = await searchYouTube(query, 1);
+    const matched = searchResults[0];
+
+    const isSpotify = query.includes('spotify.com');
+    const newTrack: MusicQueueItem = matched ? {
+      ...matched,
+      requestedBy,
+      addedAt: Date.now(),
+    } : {
       id: `track_${Date.now()}`,
       title: query,
-      artist: 'Unknown Artist',
+      artist: isSpotify ? 'Spotify' : 'YouTube Artist',
       duration: '3:30',
-      url: query.startsWith('http') ? query : `https://youtube.com/search?q=${encodeURIComponent(query)}`,
-      source: source as any,
+      thumbnail: 'https://images.unsplash.com/photo-1511671782779-c97d3d27a1d4?w=500&auto=format&fit=crop&q=80',
+      url: query.startsWith('http') ? query : `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`,
+      source: isSpotify ? 'spotify' : 'youtube',
       requestedBy,
       addedAt: Date.now(),
     };
@@ -4241,38 +4459,35 @@ app.post('/api/music/play', async (req: Request, res: Response) => {
       musicQueue.push(newTrack);
     }
 
-    // Post Now Playing embed to a text channel near the VC
-    const guild = discordBot.guilds.cache.get(DISCORD_GUILD_ID);
-    if (guild && musicVcChannelId) {
-      const vcChan = guild.channels.cache.get(musicVcChannelId);
-      if (vcChan) {
-        // Find the first text channel in same category
-        const textChan = guild.channels.cache.find((c: any) =>
-          c.type === 0 && (c.parentId === (vcChan as any).parentId || c.name.includes('music') || c.name.includes('bot'))
-        ) as TextChannel | undefined;
+    // Post rich update embed to a text channel in Discord
+    if (guild && targetVcId) {
+      const vcChan = guild.channels.cache.get(targetVcId);
+      const textChan = guild.channels.cache.find((c: any) =>
+        c.type === 0 && (c.parentId === (vcChan as any)?.parentId || c.name.includes('music') || c.name.includes('bot') || c.name.includes('general'))
+      ) as TextChannel | undefined;
 
-        if (textChan) {
-          const embed = new EmbedBuilder()
-            .setTitle('🎵 Now Playing')
-            .setColor(0xE50914)
-            .setDescription(`**${newTrack.title}**\nRequested by **${requestedBy}**`)
-            .addFields(
-              { name: '📡 Source', value: source, inline: true },
-              { name: '🔊 VC', value: vcChan.name, inline: true },
-              { name: '📋 Queue', value: `${musicQueue.length} tracks`, inline: true }
-            )
-            .setFooter({ text: 'Club EZKEN DJ System • /play /skip /stop /volume /queue' })
-            .setTimestamp();
+      if (textChan) {
+        const embed = new EmbedBuilder()
+          .setTitle(musicCurrentTrack?.id === newTrack.id ? '🎵 Now Playing' : '📋 Added to Queue')
+          .setColor(0xE50914)
+          .setDescription(`**[${newTrack.title}](${newTrack.url})**\n🎤 **Artist:** ${newTrack.artist}\n⏱️ **Duration:** \`${newTrack.duration}\``)
+          .setThumbnail(newTrack.thumbnail)
+          .addFields(
+            { name: '📡 Source', value: newTrack.source, inline: true },
+            { name: '👤 Requested by', value: requestedBy, inline: true },
+            { name: '📋 Queue', value: `${musicQueue.length} song${musicQueue.length !== 1 ? 's' : ''} waiting`, inline: true }
+          )
+          .setFooter({ text: 'Club EZKEN DJ System • Controlled via Dashboard' })
+          .setTimestamp();
 
-          const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder().setCustomId('music:pause').setLabel('⏸ Pause').setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId('music:skip').setLabel('⏭ Skip').setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder().setCustomId('music:stop').setLabel('⏹ Stop').setStyle(ButtonStyle.Danger),
-            new ButtonBuilder().setCustomId('music:queue').setLabel('📋 Queue').setStyle(ButtonStyle.Primary),
-          );
+        const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder().setCustomId('music:pause').setLabel('⏸ Pause').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('music:skip').setLabel('⏭ Skip').setStyle(ButtonStyle.Secondary),
+          new ButtonBuilder().setCustomId('music:stop').setLabel('⏹ Stop & Leave').setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId('music:queue_btn').setLabel('📋 Queue').setStyle(ButtonStyle.Primary),
+        );
 
-          await textChan.send({ embeds: [embed], components: [row] }).catch(() => { });
-        }
+        await textChan.send({ embeds: [embed], components: [row] }).catch(() => { });
       }
     }
 
@@ -4280,6 +4495,7 @@ app.post('/api/music/play', async (req: Request, res: Response) => {
       success: true,
       track: newTrack,
       queuePosition: musicCurrentTrack?.id === newTrack.id ? 0 : musicQueue.length,
+      queue: musicQueue,
     });
   } catch (err: any) {
     return res.status(500).json({ error: err.message });
@@ -4296,15 +4512,36 @@ app.post('/api/music/skip', (_req: Request, res: Response) => {
     musicCurrentTrack = null;
     musicIsPlaying = false;
   }
-  return res.json({ success: true, skipped: prev, nowPlaying: musicCurrentTrack });
+  return res.json({ success: true, skipped: prev, nowPlaying: musicCurrentTrack, queue: musicQueue });
 });
 
-// POST /api/music/stop - Stop music and clear queue
+// POST /api/music/pause - Toggle pause
+app.post('/api/music/pause', (_req: Request, res: Response) => {
+  musicIsPlaying = !musicIsPlaying;
+  return res.json({ success: true, isPlaying: musicIsPlaying });
+});
+
+// POST /api/music/stop - Stop music, clear queue & leave VC
 app.post('/api/music/stop', (_req: Request, res: Response) => {
-  musicCurrentTrack = null;
+  leaveVoice(DISCORD_GUILD_ID);
+  return res.json({ success: true, message: 'Music stopped and ClubEZ disconnected from voice.' });
+});
+
+// POST /api/music/remove - Remove song by ID or index
+app.post('/api/music/remove', (req: Request, res: Response) => {
+  const { trackId, index } = req.body;
+  if (trackId) {
+    musicQueue = musicQueue.filter(t => t.id !== trackId);
+  } else if (typeof index === 'number' && index >= 0 && index < musicQueue.length) {
+    musicQueue.splice(index, 1);
+  }
+  return res.json({ success: true, queue: musicQueue });
+});
+
+// POST /api/music/clear-queue - Clear only the queue
+app.post('/api/music/clear-queue', (_req: Request, res: Response) => {
   musicQueue = [];
-  musicIsPlaying = false;
-  return res.json({ success: true, message: 'Music stopped and queue cleared.' });
+  return res.json({ success: true, queue: [] });
 });
 
 // POST /api/music/volume - Set volume
@@ -4315,6 +4552,29 @@ app.post('/api/music/volume', (req: Request, res: Response) => {
   }
   musicVolume = volume;
   return res.json({ success: true, volume });
+});
+
+// POST /api/music/loop - Toggle loop
+app.post('/api/music/loop', (req: Request, res: Response) => {
+  const { mode } = req.body;
+  if (mode && ['off', 'track', 'queue'].includes(mode)) {
+    musicLoopMode = mode;
+  } else {
+    musicLoopMode = musicLoopMode === 'off' ? 'track' : musicLoopMode === 'track' ? 'queue' : 'off';
+  }
+  return res.json({ success: true, loop: musicLoopMode });
+});
+
+// POST /api/music/shuffle - Toggle shuffle
+app.post('/api/music/shuffle', (_req: Request, res: Response) => {
+  musicShuffleEnabled = !musicShuffleEnabled;
+  if (musicShuffleEnabled && musicQueue.length > 1) {
+    for (let i = musicQueue.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [musicQueue[i], musicQueue[j]] = [musicQueue[j], musicQueue[i]];
+    }
+  }
+  return res.json({ success: true, shuffle: musicShuffleEnabled, queue: musicQueue });
 });
 
 // POST /api/music/deploy-panel - Deploy interactive music panel to Discord text channel
