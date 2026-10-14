@@ -96,6 +96,60 @@ export function buildTempVoiceInterface() {
   return { embed, components: [row1, row2, row3] };
 }
 
+export async function autoSetupTempVoice(client, guildId) {
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) throw new Error('Guild not found');
+
+  const config = loadTempVoiceConfig();
+
+  // Create or find the category
+  let category = config.categoryId ? guild.channels.cache.get(config.categoryId) : null;
+  if (!category || category.type !== ChannelType.GuildCategory) {
+    category = await guild.channels.create({
+      name: config.categoryName || 'PRIVATE VC CHANNEL',
+      type: ChannelType.GuildCategory,
+    });
+    config.categoryId = category.id;
+  }
+
+  // Create or find the creator (join) channel
+  let creatorChannel = config.creatorChannelId ? guild.channels.cache.get(config.creatorChannelId) : null;
+  if (!creatorChannel || creatorChannel.type !== ChannelType.GuildVoice) {
+    creatorChannel = await guild.channels.create({
+      name: config.creatorChannelName || '➕ Creator Channel',
+      type: ChannelType.GuildVoice,
+      parent: category.id,
+    });
+    config.creatorChannelId = creatorChannel.id;
+  }
+
+  // Create or find the control text channel for the interface
+  let controlChannel = config.controlChannelId ? guild.channels.cache.get(config.controlChannelId) : null;
+  if (!controlChannel || controlChannel.type !== ChannelType.GuildText) {
+    controlChannel = await guild.channels.create({
+      name: config.controlChannelName || '✨・voice-command',
+      type: ChannelType.GuildText,
+      parent: category.id,
+    });
+    config.controlChannelId = controlChannel.id;
+  }
+
+  config.enabled = true;
+  saveTempVoiceConfig(config);
+
+  // Deploy the interface in the control channel
+  const { embed, components } = buildTempVoiceInterface();
+  await controlChannel.send({ embeds: [embed], components }).catch(() => {});
+
+  return {
+    success: true,
+    categoryId: category.id,
+    creatorChannelId: creatorChannel.id,
+    controlChannelId: controlChannel.id,
+    message: `TempVoice system set up: Category "${category.name}", Creator VC, and Control Channel in #${controlChannel.name}`,
+  };
+}
+
 export async function handleTempVoiceVoiceStateUpdate(oldState, newState, client) {
   const config = loadTempVoiceConfig();
   if (!config.enabled) return;

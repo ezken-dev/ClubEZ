@@ -124,6 +124,60 @@ async function generateChannelTranscript(channel, ticket) {
   }
 }
 
+export async function autoSetupTickets(client, guildId) {
+  const guild = client.guilds.cache.get(guildId);
+  if (!guild) throw new Error('Guild not found');
+
+  const cfg = loadTicketConfig();
+
+  // Create or find the open category
+  let openCategory = cfg.openCategoryId ? guild.channels.cache.get(cfg.openCategoryId) : null;
+  if (!openCategory || openCategory.type !== ChannelType.GuildCategory) {
+    openCategory = await guild.channels.create({
+      name: 'TICKETS',
+      type: ChannelType.GuildCategory,
+    });
+    cfg.openCategoryId = openCategory.id;
+  }
+
+  // Create or find the panel channel
+  let panelChannel = cfg.panelChannelId ? guild.channels.cache.get(cfg.panelChannelId) : null;
+  if (!panelChannel || panelChannel.type !== ChannelType.GuildText) {
+    panelChannel = await guild.channels.create({
+      name: '📩・support',
+      type: ChannelType.GuildText,
+      parent: openCategory.id,
+    });
+    cfg.panelChannelId = panelChannel.id;
+  }
+
+  // Create or find the logs channel
+  let logsChannel = cfg.logsChannelId ? guild.channels.cache.get(cfg.logsChannelId) : null;
+  if (!logsChannel || logsChannel.type !== ChannelType.GuildText) {
+    logsChannel = await guild.channels.create({
+      name: '📋・ticket-logs',
+      type: ChannelType.GuildText,
+      parent: openCategory.id,
+    });
+    cfg.logsChannelId = logsChannel.id;
+  }
+
+  cfg.enabled = true;
+  saveTicketConfig(cfg);
+
+  // Deploy the ticket panel
+  const { embed, components } = buildTicketPanelInterface(cfg);
+  await panelChannel.send({ embeds: [embed], components }).catch(() => {});
+
+  return {
+    success: true,
+    openCategoryId: openCategory.id,
+    panelChannelId: panelChannel.id,
+    logsChannelId: logsChannel.id,
+    message: `Ticket system set up: Category, Panel in #${panelChannel.name}, and Logs in #${logsChannel.name}`,
+  };
+}
+
 export async function handleTicketInteraction(interaction, client) {
   if (interaction.isButton() && interaction.customId.startsWith('ticket:')) {
     const parts = interaction.customId.split(':');
