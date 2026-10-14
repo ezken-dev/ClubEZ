@@ -3437,6 +3437,7 @@ const moderateMemberDeclaration: FunctionDeclaration = {
 // POST /api/gemini/architect - Autonomous Gemini AI Engine (with Image Upload)
 // -----------------------------------------------------------------------------
 app.post('/api/gemini/architect', async (req: Request, res: Response) => {
+  const reqStartTime = Date.now();
   try {
     const { prompt, imageBase64, imageMimeType } = req.body;
 
@@ -3486,8 +3487,8 @@ YOUR DIRECTIVES:
   let aiMessage = '';
   let modelWorked = false;
 
-  // Model priority: gemini-3.8-flash (primary active AI Studio model), followed by fallbacks
-  const modelCandidates = ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.1-flash-lite', 'gemini-2.5-flash'];
+  // Primary active model
+  const targetModel = 'gemini-3.8-flash';
 
   if (aiClient) {
     // Build multimodal content (text + optional image)
@@ -3511,37 +3512,32 @@ YOUR DIRECTIVES:
       contents = prompt;
     }
 
-    for (const model of modelCandidates) {
-      // Up to 3 attempts with backoff for temporary 503 high-demand spikes
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          const response = await aiClient.models.generateContent({
-            model,
-            contents,
-            config: {
-              systemInstruction,
-              tools,
-            },
-          });
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const response = await aiClient.models.generateContent({
+          model: targetModel,
+          contents,
+          config: {
+            systemInstruction,
+            tools,
+          },
+        });
 
-          const calls = response.functionCalls || [];
-          for (const call of calls) {
-            const receipt = await executeServerAction(call.name || '', call.args || {}, currentChannels, currentRoles);
-            executedActions.push(receipt);
-          }
+        const calls = response.functionCalls || [];
+        for (const call of calls) {
+          const receipt = await executeServerAction(call.name || '', call.args || {}, currentChannels, currentRoles);
+          executedActions.push(receipt);
+        }
 
-          aiMessage = response.text || '';
-          modelWorked = true;
-          break; // Success on this model
-        } catch (modelErr: any) {
-          console.warn(`[AI ARCHITECT] Model ${model} attempt ${attempt} warning: ${modelErr.message}`);
-          if (attempt < 3 && (modelErr.message.includes('503') || modelErr.message.includes('high demand') || modelErr.message.includes('rate'))) {
-            await new Promise(r => setTimeout(r, 1000 * attempt));
-          }
+        aiMessage = response.text || '';
+        modelWorked = true;
+        break;
+      } catch (modelErr: any) {
+        console.warn(`[AI ARCHITECT] ${targetModel} attempt ${attempt} warning: ${modelErr.message}`);
+        if (attempt < 2 && (modelErr.message.includes('503') || modelErr.message.includes('high demand'))) {
+          await new Promise(r => setTimeout(r, 1200));
         }
       }
-
-      if (modelWorked) break;
     }
   }
 
@@ -3573,6 +3569,13 @@ YOUR DIRECTIVES:
       guildStats: {
         channelsCount: currentChannels.length,
         rolesCount: currentRoles.length,
+      },
+      thinking: {
+        model: 'Gemini 3.8 Flash',
+        groundedChannels: currentChannels.length,
+        groundedRoles: currentRoles.length,
+        actionsCount: executedActions.length,
+        durationMs: Date.now() - reqStartTime,
       }
     });
   } catch (err: any) {
