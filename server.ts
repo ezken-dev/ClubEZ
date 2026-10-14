@@ -59,7 +59,22 @@ const PORT = process.env.SERVER_PORT || process.env.PORT || 3000;
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// UPDATE 2: Added CORS bypass to prevent Netlify / Browser blocking errors
+// Request logging middleware to debug proxy issues
+app.use((req, res, next) => {
+  console.log(`[REQUEST] ${req.method} ${req.path} from ${req.headers['x-forwarded-for'] || req.ip}`);
+  next();
+});
+
+// Health check endpoint
+app.get('/api/health', (_req: Request, res: Response) => {
+  return res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    port: PORT,
+    env: process.env.NODE_ENV || 'development',
+  });
+});
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
