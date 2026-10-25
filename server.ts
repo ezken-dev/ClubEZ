@@ -330,8 +330,9 @@ const musicPlayer = createAudioPlayer({
   behaviors: { noSubscriber: NoSubscriberBehavior.Play },
 });
 
-musicPlayer.on('stateChange', (_oldState, newState) => {
+musicPlayer.on('stateChange', (oldState, newState) => {
   musicIsPlaying = newState.status === AudioPlayerStatus.Playing;
+  console.log(`[MUSIC PLAYER STATUS] ${oldState.status} -> ${newState.status}`);
 });
 
 musicPlayer.on(AudioPlayerStatus.Idle, () => {
@@ -860,6 +861,7 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
         const query = interaction.options.getString('query', true);
         const member = interaction.guild?.members.cache.get(interaction.user.id);
         const vcChannel = member?.voice?.channel;
+        console.log(`[SLASH /play] User ${interaction.user.tag} in #${vcChannel?.name || 'none'} query: "${query}"`);
 
         if (!vcChannel) {
           await interaction.reply({
