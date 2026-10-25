@@ -3392,7 +3392,7 @@ app.get('/api/discord/members', async (_req: Request, res: Response) => {
 });
 
 // -----------------------------------------------------------------------------
-// AUTONOMOUS DISCORD ACTION EXECUTOR
+// AUTONOMOUS DISCORD ACTION EXECUTOR — V2 MEGA BRAIN
 // -----------------------------------------------------------------------------
 
 interface ActionReceipt {
@@ -3402,8 +3402,154 @@ interface ActionReceipt {
   success: boolean;
 }
 
+// ==================== PERSISTENT CHAT MEMORY ====================
+// Stores full conversation history per session so the AI remembers everything
+const aiChatMemory: Array<{ role: string; parts: Array<{ text: string }> }> = [];
+const AI_MEMORY_MAX_TURNS = 60; // Keep last 60 turns (30 user + 30 assistant)
+
 async function executeServerAction(actionName: string, args: any, currentChannels: any[], currentRoles: any[]): Promise<ActionReceipt> {
   try {
+    // ==================== VOICE ACTIVITY / PUSH-TO-TALK OVERRIDE ====================
+    if (actionName === 'disable_push_to_talk' || actionName === 'fix_voice_chat_permissions' || actionName === 'allow_voice_activity') {
+      const results: string[] = [];
+      const USE_VAD_BIT = 33554432n; // 1 << 25: Use Voice Activity (open mic / no PTT)
+      const SPEAK_BIT = 2097152n;     // 1 << 21: Speak
+      const CONNECT_BIT = 1048576n;   // 1 << 20: Connect
+      const STREAM_BIT = 512n;        // 1 << 9:  Video / Screen Share
+
+      // 1. Update @everyone role at the server level so Voice Activity Detection is enabled by default
+      const everyoneRole = currentRoles.find(r => r.id === DISCORD_GUILD_ID || r.name === '@everyone');
+      if (everyoneRole) {
+        try {
+          const currentBits = BigInt(everyoneRole.permissions || '0');
+          const newBits = currentBits | USE_VAD_BIT | SPEAK_BIT | CONNECT_BIT | STREAM_BIT;
+          const patchRes = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/roles/${everyoneRole.id}`, {
+            method: 'PATCH',
+            headers: getDiscordHeaders(),
+            body: JSON.stringify({ permissions: newBits.toString() }),
+          });
+          if (patchRes.ok) {
+            results.push(`✅ Enabled Voice Activity Detection (Use VAD) on @everyone role`);
+          } else {
+            const errJson = await patchRes.json().catch(() => ({}));
+            results.push(`⚠️ @everyone role update: ${errJson.message || patchRes.status}`);
+          }
+        } catch (e: any) {
+          results.push(`⚠️ Role error: ${e.message}`);
+        }
+      }
+
+      // 2. Also ensure all leveling / member tier roles have USE_VAD enabled
+      const tierRoleNames = ['rookie', 'insider', 'resident', 'club regular', 'hypemaster', 'ascendant', 'club titan', 'the immortal', 'star supporter', 'member', 'verified'];
+      for (const role of currentRoles) {
+        if (tierRoleNames.includes(role.name.toLowerCase().replace(/[@\s]/g, ''))) {
+          try {
+            const rBits = BigInt(role.permissions || '0');
+            const newRBits = rBits | USE_VAD_BIT | SPEAK_BIT | CONNECT_BIT;
+            await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/roles/${role.id}`, {
+              method: 'PATCH',
+              headers: getDiscordHeaders(),
+              body: JSON.stringify({ permissions: newRBits.toString() }),
+            });
+          } catch {}
+        }
+      }
+
+      // 3. For every voice channel & stage channel, remove USE_VAD deny overwrites and grant allow
+      let liveChannels = currentChannels;
+      try {
+        const chanRes = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/channels`, {
+          headers: getDiscordHeaders(),
+        });
+        if (chanRes.ok) {
+          liveChannels = await chanRes.json();
+        }
+      } catch {}
+
+      const voiceChannels = liveChannels.filter((c: any) => c.type === 2 || c.type === 13);
+      let updatedVCCount = 0;
+
+      for (const vc of voiceChannels) {
+        try {
+          const overwrites = Array.isArray(vc.permission_overwrites) ? vc.permission_overwrites : [];
+          const everyoneOverwrite = overwrites.find((o: any) => o.id === DISCORD_GUILD_ID);
+
+          let allowBits = USE_VAD_BIT | SPEAK_BIT | CONNECT_BIT | STREAM_BIT;
+          let denyBits = 0n;
+
+          if (everyoneOverwrite) {
+            const existingAllow = BigInt(everyoneOverwrite.allow || '0');
+            const existingDeny = BigInt(everyoneOverwrite.deny || '0');
+            denyBits = existingDeny & ~USE_VAD_BIT; // Strip PTT requirement!
+            allowBits = existingAllow | USE_VAD_BIT | SPEAK_BIT | CONNECT_BIT;
+          }
+
+          const putRes = await fetch(`https://discord.com/api/v10/channels/${vc.id}/permissions/${DISCORD_GUILD_ID}`, {
+            method: 'PUT',
+            headers: getDiscordHeaders(),
+            body: JSON.stringify({
+              type: 0, // role
+              allow: allowBits.toString(),
+              deny: denyBits.toString(),
+            }),
+          });
+
+          // Also check other role overwrites on this channel: if any role denies USE_VAD, remove it!
+          for (const ow of overwrites) {
+            if (ow.id !== DISCORD_GUILD_ID) {
+              const owDeny = BigInt(ow.deny || '0');
+              if ((owDeny & USE_VAD_BIT) !== 0n) {
+                const cleanedDeny = owDeny & ~USE_VAD_BIT;
+                const owAllow = BigInt(ow.allow || '0') | USE_VAD_BIT;
+                await fetch(`https://discord.com/api/v10/channels/${vc.id}/permissions/${ow.id}`, {
+                  method: 'PUT',
+                  headers: getDiscordHeaders(),
+                  body: JSON.stringify({
+                    type: ow.type,
+                    allow: owAllow.toString(),
+                    deny: cleanedDeny.toString(),
+                  }),
+                });
+              }
+            }
+          }
+
+          if (putRes.ok) {
+            updatedVCCount++;
+          }
+        } catch (err: any) {
+          console.error(`[DISABLE PTT] Error on VC #${vc.name}:`, err.message);
+        }
+      }
+
+      return {
+        action: 'DISABLED_PUSH_TO_TALK',
+        details: { voiceChannelsCount: voiceChannels.length, updatedVCCount },
+        result: `✅ Disabled forced Push-to-Talk server-wide! All ${updatedVCCount} voice channels and server roles now allow Voice Activity Detection (open mic) for everyone. Members can now speak freely without holding a button!`,
+        success: true,
+      };
+    }
+
+    if (actionName === 'get_server_overview') {
+      const liveChannels = await fetchGuildChannels();
+      const liveRoles = await fetchGuildRoles();
+      const textChannels = liveChannels.filter(c => c.type === 0).map(c => `#${c.name}`).join(', ');
+      const voiceChannels = liveChannels.filter(c => c.type === 2).map(c => `🔊 #${c.name}`).join(', ');
+      const categories = liveChannels.filter(c => c.type === 4).map(c => `📁 ${c.name}`).join(', ');
+      const topRoles = liveRoles.map(r => `@${r.name}`).slice(0, 30).join(', ');
+
+      return {
+        action: 'SERVER_OVERVIEW',
+        details: { channelsCount: liveChannels.length, rolesCount: liveRoles.length },
+        result: `📊 **Club EZKEN Live Server Overview**:\n` +
+          `• **Total Channels**: ${liveChannels.length} (${categories ? `Categories: ${categories} | ` : ''}Text: ${textChannels.slice(0, 100)}... | Voice: ${voiceChannels.slice(0, 100)}...)\n` +
+          `• **Total Roles**: ${liveRoles.length} (${topRoles.slice(0, 120)}...)\n` +
+          `• **Level Tiers Configured**: ${Object.keys(levelTiers).length} tiers`,
+        success: true,
+      };
+    }
+
+    // ==================== ROLE MANAGEMENT ====================
     if (actionName === 'create_role') {
       const colorInt = parseInt((args.colorHex || '#E50914').replace('#', ''), 16) || 15010068;
       const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/roles`, {
@@ -3414,6 +3560,7 @@ async function executeServerAction(actionName: string, args: any, currentChannel
           color: colorInt,
           hoist: args.hoist !== undefined ? !!args.hoist : true,
           mentionable: !!args.mentionable,
+          permissions: args.permissions || undefined,
         }),
       });
       const data = await res.json();
@@ -3421,20 +3568,9 @@ async function executeServerAction(actionName: string, args: any, currentChannel
         if (args.levelPerk && typeof args.levelPerk === 'number') {
           levelTiers[args.levelPerk] = { name: args.name, color: args.colorHex || '#E50914' };
         }
-        return {
-          action: 'CREATED_ROLE',
-          details: { ...args, roleId: data.id },
-          result: `Successfully created role @${args.name} in Discord (ID:${data.id})` + (args.levelPerk ? ` & mapped to Level ${args.levelPerk}` : ''),
-          success: true,
-        };
-      } else {
-        return {
-          action: 'CREATED_ROLE_FAILED',
-          details: args,
-          result: `Discord API error creating @${args.name}:${data.message || 'Failed'}`,
-          success: false,
-        };
+        return { action: 'CREATED_ROLE', details: { ...args, roleId: data.id }, result: `Created role @${args.name} (ID:${data.id})${args.levelPerk ? ` & mapped to Level ${args.levelPerk}` : ''}`, success: true };
       }
+      return { action: 'CREATED_ROLE_FAILED', details: args, result: `Failed to create @${args.name}: ${data.message || 'Error'}`, success: false };
     }
 
     if (actionName === 'delete_role') {
@@ -3443,58 +3579,57 @@ async function executeServerAction(actionName: string, args: any, currentChannel
         const found = currentRoles.find(r => r.name.toLowerCase() === args.name.toLowerCase().replace('@', ''));
         if (found) targetRoleId = found.id;
       }
-      if (!targetRoleId) {
-        return { action: 'DELETE_ROLE_NOT_FOUND', details: args, result: `Could not locate role "${args.name || args.roleId}" in server.`, success: false };
-      }
-
-      const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/roles/${targetRoleId}`, {
-        method: 'DELETE',
-        headers: getDiscordHeaders(),
-      });
-      return {
-        action: 'DELETED_ROLE',
-        details: { targetRoleId, name: args.name },
-        result: res.ok ? `Deleted role in Discord (ID: ${targetRoleId})` : `Failed to delete role: status ${res.status}`,
-        success: res.ok,
-      };
+      if (!targetRoleId) return { action: 'DELETE_ROLE_NOT_FOUND', details: args, result: `Could not locate role "${args.name}"`, success: false };
+      const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/roles/${targetRoleId}`, { method: 'DELETE', headers: getDiscordHeaders() });
+      return { action: 'DELETED_ROLE', details: { targetRoleId, name: args.name }, result: res.ok ? `Deleted role @${args.name}` : `Failed: status ${res.status}`, success: res.ok };
     }
 
+    if (actionName === 'edit_role') {
+      let targetRoleId = args.roleId;
+      if (!targetRoleId && args.name) {
+        const found = currentRoles.find(r => r.name.toLowerCase() === args.name.toLowerCase().replace('@', ''));
+        if (found) targetRoleId = found.id;
+      }
+      if (!targetRoleId) return { action: 'EDIT_ROLE_NOT_FOUND', details: args, result: `Could not locate role "${args.name}"`, success: false };
+      const payload: any = {};
+      if (args.newName) payload.name = args.newName;
+      if (args.colorHex) payload.color = parseInt(args.colorHex.replace('#', ''), 16);
+      if (args.hoist !== undefined) payload.hoist = !!args.hoist;
+      if (args.mentionable !== undefined) payload.mentionable = !!args.mentionable;
+      if (args.permissions !== undefined) payload.permissions = String(args.permissions);
+      const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/roles/${targetRoleId}`, {
+        method: 'PATCH', headers: getDiscordHeaders(), body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      return { action: 'EDITED_ROLE', details: { ...args, roleId: targetRoleId }, result: res.ok ? `Updated role @${args.newName || args.name} — ${Object.keys(payload).join(', ')} changed` : `Failed: ${data.message}`, success: res.ok };
+    }
+
+    // ==================== CHANNEL MANAGEMENT ====================
     if (actionName === 'create_channel') {
       const isCategory = args.type === 'category';
       const formattedName = isCategory ? args.name : (args.name || 'new-channel').toLowerCase().replace(/\s+/g, '-');
-      let discordType = 0; // Text
+      let discordType = 0;
       if (args.type === 'voice') discordType = 2;
       if (args.type === 'category') discordType = 4;
       if (args.type === 'announcement') discordType = 5;
-
-      const payload: any = {
-        name: formattedName,
-        type: discordType,
-      };
+      if (args.type === 'stage') discordType = 13;
+      if (args.type === 'forum') discordType = 15;
+      const payload: any = { name: formattedName, type: discordType };
       if (args.topic && discordType === 0) payload.topic = args.topic;
       if (args.parentId) payload.parent_id = args.parentId;
-
+      if (args.parentName && !args.parentId) {
+        const cat = currentChannels.find(c => c.type === 4 && c.name.toLowerCase().includes(args.parentName.toLowerCase()));
+        if (cat) payload.parent_id = cat.id;
+      }
+      if (args.nsfw !== undefined) payload.nsfw = !!args.nsfw;
+      if (args.rateLimitPerUser) payload.rate_limit_per_user = args.rateLimitPerUser;
+      if (args.bitrate) payload.bitrate = args.bitrate;
+      if (args.userLimit) payload.user_limit = args.userLimit;
       const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/channels`, {
-        method: 'POST',
-        headers: getDiscordHeaders(),
-        body: JSON.stringify(payload),
+        method: 'POST', headers: getDiscordHeaders(), body: JSON.stringify(payload),
       });
       const data = await res.json();
-      if (res.ok) {
-        return {
-          action: 'CREATED_CHANNEL',
-          details: { ...args, channelId: data.id },
-          result: `Successfully created #${formattedName} in Discord (ID:${data.id})`,
-          success: true,
-        };
-      } else {
-        return {
-          action: 'CREATED_CHANNEL_FAILED',
-          details: args,
-          result: `Discord API error creating #${formattedName}:${data.message || 'Failed'}`,
-          success: false,
-        };
-      }
+      return { action: 'CREATED_CHANNEL', details: { ...args, channelId: data.id }, result: res.ok ? `Created #${formattedName} (ID:${data.id})` : `Failed: ${data.message}`, success: res.ok };
     }
 
     if (actionName === 'delete_channel') {
@@ -3504,30 +3639,288 @@ async function executeServerAction(actionName: string, args: any, currentChannel
         const found = currentChannels.find(c => c.name.toLowerCase() === clean);
         if (found) targetChannelId = found.id;
       }
-      if (!targetChannelId) {
-        return { action: 'DELETE_CHANNEL_NOT_FOUND', details: args, result: `Could not locate channel "${args.name || args.channelId}"`, success: false };
-      }
-
-      const res = await fetch(`https://discord.com/api/v10/channels/${targetChannelId}`, {
-        method: 'DELETE',
-        headers: getDiscordHeaders(),
-      });
-      return {
-        action: 'DELETED_CHANNEL',
-        details: { targetChannelId, name: args.name },
-        result: res.ok ? `Deleted channel in Discord (ID: ${targetChannelId})` : `Failed to delete channel: status ${res.status}`,
-        success: res.ok,
-      };
+      if (!targetChannelId) return { action: 'DELETE_CHANNEL_NOT_FOUND', details: args, result: `Could not locate channel "${args.name}"`, success: false };
+      const res = await fetch(`https://discord.com/api/v10/channels/${targetChannelId}`, { method: 'DELETE', headers: getDiscordHeaders() });
+      return { action: 'DELETED_CHANNEL', details: { targetChannelId, name: args.name }, result: res.ok ? `Deleted channel #${args.name}` : `Failed: status ${res.status}`, success: res.ok };
     }
 
-    if (actionName === 'assign_level_tier') {
-      levelTiers[args.level] = { name: args.tierName, color: args.colorHex || '#E50914' };
-      return {
-        action: 'ASSIGNED_LEVEL_TIER',
-        details: args,
-        result: `Configured Level ${args.level} requirement ➔ Reward: "${args.tierName}"`,
-        success: true,
-      };
+    if (actionName === 'edit_channel') {
+      let targetChannelId = args.channelId;
+      if (!targetChannelId && args.name) {
+        const clean = args.name.replace('#', '').toLowerCase();
+        const found = currentChannels.find(c => c.name.toLowerCase() === clean || c.name.toLowerCase().includes(clean));
+        if (found) targetChannelId = found.id;
+      }
+      if (!targetChannelId) return { action: 'EDIT_CHANNEL_NOT_FOUND', details: args, result: `Could not locate channel "${args.name}"`, success: false };
+      const payload: any = {};
+      if (args.newName) payload.name = args.newName.toLowerCase().replace(/\s+/g, '-');
+      if (args.topic !== undefined) payload.topic = args.topic;
+      if (args.nsfw !== undefined) payload.nsfw = !!args.nsfw;
+      if (args.rateLimitPerUser !== undefined) payload.rate_limit_per_user = args.rateLimitPerUser;
+      if (args.bitrate) payload.bitrate = args.bitrate;
+      if (args.userLimit !== undefined) payload.user_limit = args.userLimit;
+      if (args.parentId) payload.parent_id = args.parentId;
+      if (args.parentName) {
+        const cat = currentChannels.find(c => c.type === 4 && c.name.toLowerCase().includes(args.parentName.toLowerCase()));
+        if (cat) payload.parent_id = cat.id;
+      }
+      const res = await fetch(`https://discord.com/api/v10/channels/${targetChannelId}`, {
+        method: 'PATCH', headers: getDiscordHeaders(), body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      return { action: 'EDITED_CHANNEL', details: { ...args, channelId: targetChannelId }, result: res.ok ? `Updated #${args.name} — ${Object.keys(payload).join(', ')} changed` : `Failed: ${data.message}`, success: res.ok };
+    }
+
+    // ==================== PERMISSION MANAGEMENT ====================
+    if (actionName === 'edit_channel_permissions') {
+      let targetChannelId = args.channelId;
+      if (!targetChannelId && args.channelName) {
+        const clean = args.channelName.replace('#', '').toLowerCase();
+        const found = currentChannels.find(c => c.name.toLowerCase() === clean || c.name.toLowerCase().includes(clean));
+        if (found) targetChannelId = found.id;
+      }
+      if (!targetChannelId) return { action: 'EDIT_PERM_NOT_FOUND', details: args, result: `Could not locate channel "${args.channelName}"`, success: false };
+
+      // Determine target (role or member)
+      let overwriteId = args.targetId;
+      const overwriteType = args.targetType === 'member' ? 1 : 0; // 0=role, 1=member
+      if (!overwriteId && args.targetName) {
+        if (overwriteType === 0) {
+          // Look up role by name — support @everyone
+          if (args.targetName.toLowerCase() === '@everyone' || args.targetName.toLowerCase() === 'everyone') {
+            overwriteId = DISCORD_GUILD_ID; // @everyone role ID = guild ID
+          } else {
+            const role = currentRoles.find(r => r.name.toLowerCase() === args.targetName.toLowerCase().replace('@', ''));
+            if (role) overwriteId = role.id;
+          }
+        }
+      }
+      if (!overwriteId) return { action: 'EDIT_PERM_NO_TARGET', details: args, result: `Could not find target "${args.targetName}" for permissions`, success: false };
+
+      const res = await fetch(`https://discord.com/api/v10/channels/${targetChannelId}/permissions/${overwriteId}`, {
+        method: 'PUT',
+        headers: getDiscordHeaders(),
+        body: JSON.stringify({
+          type: overwriteType,
+          allow: String(args.allow || '0'),
+          deny: String(args.deny || '0'),
+        }),
+      });
+      return { action: 'EDITED_CHANNEL_PERMISSIONS', details: { ...args, channelId: targetChannelId, targetId: overwriteId }, result: res.ok ? `Updated permissions on #${args.channelName} for ${args.targetName} (allow:${args.allow}, deny:${args.deny})` : `Failed: status ${res.status}`, success: res.ok };
+    }
+
+    if (actionName === 'delete_channel_permissions') {
+      let targetChannelId = args.channelId;
+      if (!targetChannelId && args.channelName) {
+        const clean = args.channelName.replace('#', '').toLowerCase();
+        const found = currentChannels.find(c => c.name.toLowerCase() === clean || c.name.toLowerCase().includes(clean));
+        if (found) targetChannelId = found.id;
+      }
+      let overwriteId = args.targetId;
+      if (!overwriteId && args.targetName) {
+        if (args.targetName.toLowerCase() === '@everyone' || args.targetName.toLowerCase() === 'everyone') {
+          overwriteId = DISCORD_GUILD_ID;
+        } else {
+          const role = currentRoles.find(r => r.name.toLowerCase() === args.targetName.toLowerCase().replace('@', ''));
+          if (role) overwriteId = role.id;
+        }
+      }
+      if (!targetChannelId || !overwriteId) return { action: 'DELETE_PERM_FAIL', details: args, result: 'Missing channel or target for permission removal', success: false };
+      const res = await fetch(`https://discord.com/api/v10/channels/${targetChannelId}/permissions/${overwriteId}`, { method: 'DELETE', headers: getDiscordHeaders() });
+      return { action: 'DELETED_CHANNEL_PERMISSIONS', details: args, result: res.ok ? `Removed permission override on #${args.channelName} for ${args.targetName}` : `Failed: ${res.status}`, success: res.ok };
+    }
+
+    if (actionName === 'bulk_edit_channel_permissions') {
+      // Apply permission changes across ALL channels of a type, or all channels
+      const targetType = args.channelType; // 'voice', 'text', 'all'
+      let overwriteId = args.targetId;
+      if (!overwriteId && args.targetName) {
+        if (args.targetName.toLowerCase() === '@everyone' || args.targetName.toLowerCase() === 'everyone') {
+          overwriteId = DISCORD_GUILD_ID;
+        } else {
+          const role = currentRoles.find(r => r.name.toLowerCase() === args.targetName.toLowerCase().replace('@', ''));
+          if (role) overwriteId = role.id;
+        }
+      }
+      if (!overwriteId) return { action: 'BULK_PERM_NO_TARGET', details: args, result: `Could not find "${args.targetName}"`, success: false };
+
+      let channels = currentChannels;
+      if (targetType === 'voice') channels = currentChannels.filter(c => c.type === 2);
+      else if (targetType === 'text') channels = currentChannels.filter(c => c.type === 0);
+      // Skip categories
+      channels = channels.filter(c => c.type !== 4);
+
+      let successCount = 0;
+      for (const ch of channels) {
+        try {
+          const r = await fetch(`https://discord.com/api/v10/channels/${ch.id}/permissions/${overwriteId}`, {
+            method: 'PUT', headers: getDiscordHeaders(),
+            body: JSON.stringify({ type: args.targetType === 'member' ? 1 : 0, allow: String(args.allow || '0'), deny: String(args.deny || '0') }),
+          });
+          if (r.ok) successCount++;
+        } catch {}
+      }
+      return { action: 'BULK_EDITED_PERMISSIONS', details: args, result: `Updated permissions on ${successCount}/${channels.length} ${targetType || 'all'} channels for ${args.targetName}`, success: successCount > 0 };
+    }
+
+    // ==================== MEMBER MANAGEMENT ====================
+    if (actionName === 'list_members') {
+      const limit = Math.min(args.limit || 20, 100);
+      const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members?limit=${limit}`, { headers: getDiscordHeaders() });
+      if (res.ok) {
+        const members = await res.json();
+        const list = members.map((m: any) => `${m.user.username}#${m.user.discriminator || '0'} (ID:${m.user.id}) — Roles: ${m.roles.length}`).join('\n');
+        return { action: 'LISTED_MEMBERS', details: args, result: `Found ${members.length} members:\n${list}`, success: true };
+      }
+      return { action: 'LIST_MEMBERS_FAILED', details: args, result: 'Failed to fetch members', success: false };
+    }
+
+    if (actionName === 'edit_member') {
+      const { userId, nickname, deaf, mute, roleIdsToAdd, roleIdsToRemove, rolesToAdd, rolesToRemove } = args;
+      if (!userId) return { action: 'EDIT_MEMBER_NO_ID', details: args, result: 'No userId provided', success: false };
+      const results: string[] = [];
+
+      // Edit nickname / deaf / mute
+      const patchPayload: any = {};
+      if (nickname !== undefined) patchPayload.nick = nickname;
+      if (deaf !== undefined) patchPayload.deaf = !!deaf;
+      if (mute !== undefined) patchPayload.mute = !!mute;
+      if (Object.keys(patchPayload).length > 0) {
+        const r = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/${userId}`, {
+          method: 'PATCH', headers: getDiscordHeaders(), body: JSON.stringify(patchPayload),
+        });
+        results.push(r.ok ? `Updated member properties: ${Object.keys(patchPayload).join(', ')}` : 'Failed to update member properties');
+      }
+
+      // Add roles by name
+      if (rolesToAdd && Array.isArray(rolesToAdd)) {
+        for (const roleName of rolesToAdd) {
+          const role = currentRoles.find(r => r.name.toLowerCase() === roleName.toLowerCase().replace('@', ''));
+          if (role) {
+            const r = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/${userId}/roles/${role.id}`, { method: 'PUT', headers: getDiscordHeaders() });
+            results.push(r.ok ? `Added @${role.name}` : `Failed to add @${roleName}`);
+          }
+        }
+      }
+
+      // Remove roles by name
+      if (rolesToRemove && Array.isArray(rolesToRemove)) {
+        for (const roleName of rolesToRemove) {
+          const role = currentRoles.find(r => r.name.toLowerCase() === roleName.toLowerCase().replace('@', ''));
+          if (role) {
+            const r = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/${userId}/roles/${role.id}`, { method: 'DELETE', headers: getDiscordHeaders() });
+            results.push(r.ok ? `Removed @${role.name}` : `Failed to remove @${roleName}`);
+          }
+        }
+      }
+
+      return { action: 'EDITED_MEMBER', details: args, result: results.join('; ') || 'No changes applied', success: results.length > 0 };
+    }
+
+    if (actionName === 'add_role_to_member') {
+      let roleId = args.roleId;
+      if (!roleId && args.roleName) {
+        const role = currentRoles.find(r => r.name.toLowerCase() === args.roleName.toLowerCase().replace('@', ''));
+        if (role) roleId = role.id;
+      }
+      if (!roleId || !args.userId) return { action: 'ADD_ROLE_FAIL', details: args, result: 'Missing roleId or userId', success: false };
+      const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/${args.userId}/roles/${roleId}`, { method: 'PUT', headers: getDiscordHeaders() });
+      return { action: 'ADDED_ROLE_TO_MEMBER', details: args, result: res.ok ? `Added role to user ${args.userId}` : `Failed: ${res.status}`, success: res.ok };
+    }
+
+    if (actionName === 'remove_role_from_member') {
+      let roleId = args.roleId;
+      if (!roleId && args.roleName) {
+        const role = currentRoles.find(r => r.name.toLowerCase() === args.roleName.toLowerCase().replace('@', ''));
+        if (role) roleId = role.id;
+      }
+      if (!roleId || !args.userId) return { action: 'REMOVE_ROLE_FAIL', details: args, result: 'Missing roleId or userId', success: false };
+      const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/${args.userId}/roles/${roleId}`, { method: 'DELETE', headers: getDiscordHeaders() });
+      return { action: 'REMOVED_ROLE_FROM_MEMBER', details: args, result: res.ok ? `Removed role from user ${args.userId}` : `Failed: ${res.status}`, success: res.ok };
+    }
+
+    if (actionName === 'moderate_member') {
+      const { userId, action, reason = 'Action via Club EZKEN AI', durationMinutes = 60 } = args;
+      if (action === 'TIMEOUT') {
+        const timeoutUntil = new Date(Date.now() + durationMinutes * 60 * 1000).toISOString();
+        const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/${userId}`, {
+          method: 'PATCH', headers: getDiscordHeaders(), body: JSON.stringify({ communication_disabled_until: timeoutUntil }),
+        });
+        return { action: 'TIMEOUT_MEMBER', details: args, result: res.ok ? `Timed out user ${userId} for ${durationMinutes}m` : 'Failed to timeout', success: res.ok };
+      }
+      if (action === 'UNTIMEOUT') {
+        const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/${userId}`, {
+          method: 'PATCH', headers: getDiscordHeaders(), body: JSON.stringify({ communication_disabled_until: null }),
+        });
+        return { action: 'UNTIMEOUT_MEMBER', details: args, result: res.ok ? `Removed timeout from user ${userId}` : 'Failed', success: res.ok };
+      }
+      if (action === 'KICK') {
+        const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/${userId}`, { method: 'DELETE', headers: getDiscordHeaders() });
+        return { action: 'KICK_MEMBER', details: args, result: res.ok ? `Kicked user ${userId}` : 'Failed', success: res.ok };
+      }
+      if (action === 'BAN') {
+        const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/bans/${userId}`, {
+          method: 'PUT', headers: getDiscordHeaders(), body: JSON.stringify({ reason }),
+        });
+        return { action: 'BAN_MEMBER', details: args, result: res.ok ? `Banned user ${userId}` : 'Failed', success: res.ok };
+      }
+      if (action === 'UNBAN') {
+        const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/bans/${userId}`, { method: 'DELETE', headers: getDiscordHeaders() });
+        return { action: 'UNBAN_MEMBER', details: args, result: res.ok ? `Unbanned user ${userId}` : 'Failed', success: res.ok };
+      }
+    }
+
+    // ==================== GUILD (SERVER) SETTINGS ====================
+    if (actionName === 'get_guild_info') {
+      const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}?with_counts=true`, { headers: getDiscordHeaders() });
+      if (res.ok) {
+        const g = await res.json();
+        return { action: 'GOT_GUILD_INFO', details: {}, result: `Server: ${g.name} | Members: ${g.approximate_member_count || 'N/A'} | Verification: ${g.verification_level} | Boost Tier: ${g.premium_tier} | Boosts: ${g.premium_subscription_count || 0} | System Channel: ${g.system_channel_id || 'None'} | Default Notifications: ${g.default_message_notifications === 0 ? 'All Messages' : 'Only Mentions'} | NSFW Level: ${g.nsfw_level}`, success: true };
+      }
+      return { action: 'GET_GUILD_FAILED', details: {}, result: 'Failed to fetch guild info', success: false };
+    }
+
+    if (actionName === 'edit_guild') {
+      const payload: any = {};
+      if (args.name) payload.name = args.name;
+      if (args.verificationLevel !== undefined) payload.verification_level = args.verificationLevel; // 0-4
+      if (args.defaultMessageNotifications !== undefined) payload.default_message_notifications = args.defaultMessageNotifications; // 0=all, 1=mentions only
+      if (args.explicitContentFilter !== undefined) payload.explicit_content_filter = args.explicitContentFilter; // 0-2
+      if (args.systemChannelId) payload.system_channel_id = args.systemChannelId;
+      if (args.afkChannelId) payload.afk_channel_id = args.afkChannelId;
+      if (args.afkTimeout) payload.afk_timeout = args.afkTimeout;
+      const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}`, {
+        method: 'PATCH', headers: getDiscordHeaders(), body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      return { action: 'EDITED_GUILD', details: payload, result: res.ok ? `Updated server settings: ${Object.keys(payload).join(', ')}` : `Failed: ${data.message}`, success: res.ok };
+    }
+
+    // ==================== MESSAGE MANAGEMENT ====================
+    if (actionName === 'send_message') {
+      let targetId = args.channelId;
+      if (!targetId && args.channelName) {
+        const clean = args.channelName.replace('#', '').toLowerCase();
+        const found = currentChannels.find(c => c.name.toLowerCase() === clean || c.name.toLowerCase().includes(clean));
+        if (found) targetId = found.id;
+      }
+      if (!targetId) return { action: 'SEND_MSG_NO_CHANNEL', details: args, result: `Could not find channel "${args.channelName}"`, success: false };
+      const body: any = {};
+      if (args.content) body.content = args.content;
+      if (args.embedTitle || args.embedDescription) {
+        body.embeds = [{
+          title: args.embedTitle || undefined,
+          description: args.embedDescription || undefined,
+          color: parseInt((args.colorHex || '#E50914').replace('#', ''), 16) || 15010068,
+          footer: args.embedFooter ? { text: args.embedFooter } : undefined,
+          timestamp: new Date().toISOString(),
+        }];
+      }
+      const res = await fetch(`https://discord.com/api/v10/channels/${targetId}/messages`, {
+        method: 'POST', headers: getDiscordHeaders(), body: JSON.stringify(body),
+      });
+      const data = await res.json();
+      return { action: 'SENT_MESSAGE', details: { ...args, channelId: targetId }, result: res.ok ? `Sent message to #${args.channelName || targetId}` : `Failed: ${data.message}`, success: res.ok };
     }
 
     if (actionName === 'send_announcement') {
@@ -3541,60 +3934,49 @@ async function executeServerAction(actionName: string, args: any, currentChannel
         const fallback = currentChannels.find(c => c.name.includes('announcement') || c.name.includes('general') || c.type === 0);
         if (fallback) targetId = fallback.id;
       }
-
       if (targetId) {
         const colorInt = parseInt((args.colorHex || '#E50914').replace('#', ''), 16) || 15010068;
         const res = await fetch(`https://discord.com/api/v10/channels/${targetId}/messages`, {
-          method: 'POST',
-          headers: getDiscordHeaders(),
-          body: JSON.stringify({
-            embeds: [
-              {
-                title: args.title || 'Club EZKEN Announcement',
-                description: args.description || '',
-                color: colorInt,
-                footer: { text: 'Club EZKEN Official Broadcast' },
-                timestamp: new Date().toISOString(),
-              },
-            ],
-          }),
+          method: 'POST', headers: getDiscordHeaders(),
+          body: JSON.stringify({ embeds: [{ title: args.title || 'Club EZKEN Announcement', description: args.description || '', color: colorInt, footer: { text: 'Club EZKEN Official' }, timestamp: new Date().toISOString() }] }),
         });
         const data = await res.json();
-        return {
-          action: 'SENT_ANNOUNCEMENT',
-          details: { ...args, channelId: targetId },
-          result: res.ok ? `Dispatched announcement "${args.title}" directly to Discord channel #${args.channelName || targetId}` : `Announcement API status: ${data.message || 'Error'}`,
-          success: res.ok,
-        };
+        return { action: 'SENT_ANNOUNCEMENT', details: { ...args, channelId: targetId }, result: res.ok ? `Sent announcement "${args.title}" to #${args.channelName || targetId}` : `Failed: ${data.message}`, success: res.ok };
       }
+      return { action: 'ANNOUNCE_NO_CHANNEL', details: args, result: 'No target channel found', success: false };
     }
 
-    if (actionName === 'moderate_member') {
-      const { userId, action, reason = 'Action performed via Club EZKEN AI Architect', durationMinutes = 60 } = args;
-      if (action === 'TIMEOUT') {
-        const timeoutUntil = new Date(Date.now() + durationMinutes * 60 * 1000).toISOString();
-        const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/${userId}`, {
-          method: 'PATCH',
-          headers: getDiscordHeaders(),
-          body: JSON.stringify({ communication_disabled_until: timeoutUntil }),
-        });
-        return { action: 'TIMEOUT_MEMBER', details: args, result: res.ok ? `Timed out user ${userId} for${durationMinutes}m` : 'Failed to timeout user', success: res.ok };
+    if (actionName === 'purge_messages') {
+      let targetId = args.channelId;
+      if (!targetId && args.channelName) {
+        const clean = args.channelName.replace('#', '').toLowerCase();
+        const found = currentChannels.find(c => c.name.toLowerCase() === clean);
+        if (found) targetId = found.id;
       }
-      if (action === 'KICK') {
-        const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/members/${userId}`, {
-          method: 'DELETE',
-          headers: getDiscordHeaders(),
-        });
-        return { action: 'KICK_MEMBER', details: args, result: res.ok ? `Kicked user ${userId}` : 'Failed to kick user', success: res.ok };
+      if (!targetId) return { action: 'PURGE_NO_CHANNEL', details: args, result: 'Channel not found', success: false };
+      const count = Math.min(args.count || 10, 100);
+      // Fetch message IDs first
+      const msgsRes = await fetch(`https://discord.com/api/v10/channels/${targetId}/messages?limit=${count}`, { headers: getDiscordHeaders() });
+      if (!msgsRes.ok) return { action: 'PURGE_FETCH_FAIL', details: args, result: 'Failed to fetch messages', success: false };
+      const msgs = await msgsRes.json();
+      const ids = msgs.map((m: any) => m.id);
+      if (ids.length < 2) {
+        // Delete individually
+        for (const id of ids) {
+          await fetch(`https://discord.com/api/v10/channels/${targetId}/messages/${id}`, { method: 'DELETE', headers: getDiscordHeaders() });
+        }
+        return { action: 'PURGED_MESSAGES', details: args, result: `Deleted ${ids.length} message(s) from #${args.channelName}`, success: true };
       }
-      if (action === 'BAN') {
-        const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/bans/${userId}`, {
-          method: 'PUT',
-          headers: getDiscordHeaders(),
-          body: JSON.stringify({ reason }),
-        });
-        return { action: 'BAN_MEMBER', details: args, result: res.ok ? `Banned user ${userId} from Discord` : 'Failed to ban user', success: res.ok };
-      }
+      const res = await fetch(`https://discord.com/api/v10/channels/${targetId}/messages/bulk-delete`, {
+        method: 'POST', headers: getDiscordHeaders(), body: JSON.stringify({ messages: ids }),
+      });
+      return { action: 'PURGED_MESSAGES', details: args, result: res.ok ? `Purged ${ids.length} messages from #${args.channelName}` : `Bulk delete failed (messages may be >14 days old)`, success: res.ok };
+    }
+
+    // ==================== LEVEL TIER MANAGEMENT ====================
+    if (actionName === 'assign_level_tier') {
+      levelTiers[args.level] = { name: args.tierName, color: args.colorHex || '#E50914' };
+      return { action: 'ASSIGNED_LEVEL_TIER', details: args, result: `Level ${args.level} → "${args.tierName}"`, success: true };
     }
 
     return { action: actionName, details: args, result: 'Action completed', success: true };
@@ -3611,10 +3993,44 @@ function parseNaturalLanguageIntent(prompt: string): Array<{ name: string; args:
   const text = prompt.trim();
   const lower = text.toLowerCase();
 
-  // 1. Role Creation Pattern (e.g. "create role VIP Elite with gold color at level 25")
+  // 0. PRIORITY 1: Push-to-Talk / Normal Voice Activity Intent
+  // User wants to disable forced PTT, enable voice activity, let members talk normally
+  if (
+    /push\s*to\s*talk|ptt|talk\s*normally|voice\s*activity|open\s*mic|can'?t\s*talk\s*in\s*v(?:c|oice)|allow.*(?:talk|speak)|disable.*push|enable.*(?:talk|vad)|remove.*push/i.test(text)
+  ) {
+    actions.push({
+      name: 'disable_push_to_talk',
+      args: { targetChannels: 'all' },
+    });
+    return actions; // Immediately return to prevent false channel creation!
+  }
+
+  // 1. Server Overview / Audit
+  if (/server\s*(?:status|overview|info|summary|audit)|how\s*many\s*(?:channels|roles|members)/i.test(text)) {
+    actions.push({
+      name: 'get_server_overview',
+      args: {},
+    });
+    return actions;
+  }
+
+  // 2. Message Purge Pattern (e.g. "purge 25 messages in general", "clear 10 messages")
+  const purgeMatch = text.match(/(?:purge|clear|clean|delete)\s+(\d+)\s+messages?(?:\s+(?:in|from)\s+([#a-zA-Z0-9_-]+))?/i);
+  if (purgeMatch) {
+    actions.push({
+      name: 'purge_messages',
+      args: {
+        count: parseInt(purgeMatch[1]),
+        channelName: purgeMatch[2] ? purgeMatch[2].replace('#', '') : 'general',
+      },
+    });
+    return actions;
+  }
+
+  // 3. Role Creation Pattern (e.g. "create role VIP Elite with gold color at level 25")
   const roleRegex = /(?:create|make|add)\s+(?:a\s+)?role\s+(?:named|called\s+)?["']?([a-zA-Z0-9\s_-]+?)["']?(?:\s+(?:with|color)\s+([#a-zA-Z0-9]+))?(?:\s+(?:at|to|for)\s+level\s+(\d+))?(?:$|\.|\band\b)/i;
   const roleMatch = text.match(roleRegex);
-  if (roleMatch) {
+  if (roleMatch && !lower.includes('channel') && !lower.includes('voice')) {
     const name = roleMatch[1].trim();
     let colorHex = '#E50914';
     if (roleMatch[2]) {
@@ -3632,8 +4048,8 @@ function parseNaturalLanguageIntent(prompt: string): Array<{ name: string; args:
     });
   }
 
-  // 2. Channel Creation Pattern (e.g. "create a text channel named scrims-chat", "make a voice channel Lounge 2")
-  const chanRegex = /(?:create|make|add)\s+(?:a\s+)?(text|voice|announcement|category)?\s*channel\s+(?:named|called\s+)?["']?([#a-zA-Z0-9\s_-]+?)["']?(?:\s+with\s+topic\s+["']?([^"']+)["']?)?(?:$|\.|\band\b)/i;
+  // 4. Channel Creation Pattern (Requires explicit "named" or "called" or quotes to prevent false positives!)
+  const chanRegex = /(?:create|make|add)\s+(?:a\s+)?(text|voice|announcement|category)?\s*channel\s+(?:named|called)\s+["']?([#a-zA-Z0-9\s_-]+?)["']?(?:\s+with\s+topic\s+["']?([^"']+)["']?)?(?:$|\.|\band\b)/i;
   const chanMatch = text.match(chanRegex);
   if (chanMatch) {
     const type = (chanMatch[1] || 'text').toLowerCase();
@@ -3645,7 +4061,7 @@ function parseNaturalLanguageIntent(prompt: string): Array<{ name: string; args:
     });
   }
 
-  // 3. Delete Channel Pattern (e.g. "delete channel tournament-chat")
+  // 5. Delete Channel Pattern (e.g. "delete channel tournament-chat")
   const delChanRegex = /(?:delete|remove)\s+(?:the\s+)?channel\s+["']?([#a-zA-Z0-9\s_-]+?)["']?(?:$|\.|\band\b)/i;
   const delChanMatch = text.match(delChanRegex);
   if (delChanMatch) {
@@ -3655,7 +4071,7 @@ function parseNaturalLanguageIntent(prompt: string): Array<{ name: string; args:
     });
   }
 
-  // 4. Delete Role Pattern (e.g. "delete role VIP")
+  // 6. Delete Role Pattern (e.g. "delete role VIP")
   const delRoleRegex = /(?:delete|remove)\s+(?:the\s+)?role\s+["']?([@a-zA-Z0-9\s_-]+?)["']?(?:$|\.|\band\b)/i;
   const delRoleMatch = text.match(delRoleRegex);
   if (delRoleMatch) {
@@ -3665,7 +4081,7 @@ function parseNaturalLanguageIntent(prompt: string): Array<{ name: string; args:
     });
   }
 
-  // 5. Level Tier Assignment Pattern (e.g. "assign level 40 to Apex Champion")
+  // 7. Level Tier Assignment Pattern (e.g. "assign level 40 to Apex Champion")
   const lvlRegex = /(?:assign|set|map)\s+level\s+(\d+)\s+(?:to|as)\s+["']?([a-zA-Z0-9\s_-]+?)["']?/i;
   const lvlMatch = text.match(lvlRegex);
   if (lvlMatch) {
@@ -3675,7 +4091,7 @@ function parseNaturalLanguageIntent(prompt: string): Array<{ name: string; args:
     });
   }
 
-  // 6. Announcement Pattern (e.g. "send announcement welcoming everyone to Season 5")
+  // 8. Announcement Pattern (e.g. "send announcement welcoming everyone to Season 5")
   const announceRegex = /(?:send|dispatch|post|write)\s+(?:an?\s+)?announcement(?:\s+post)?(?:\s+(?:to|in)\s+([#a-zA-Z0-9_-]+)\s*)?(?:saying|with\s+title|welcoming)?\s*["']?([^"']*)["']?/i;
   const announceMatch = text.match(announceRegex);
   if (announceMatch && !actions.some(a => a.name === 'send_announcement')) {
@@ -3690,28 +4106,57 @@ function parseNaturalLanguageIntent(prompt: string): Array<{ name: string; args:
     });
   }
 
-  // 7. Test / Welcome Message Pattern (e.g. "test a welcoming message and send it in #general")
-  const welcomeMsgRegex = /(?:test|send|post)\s+(?:a\s+)?(?:welcoming\s+|welcome\s+)?(?:message|embed)?\s*(?:and\s+send\s+it\s+)?(?:in|to)\s+([#a-zA-Z0-9_-]+)/i;
-  const welcomeMsgMatch = text.match(welcomeMsgRegex);
-  if (welcomeMsgMatch && !actions.some(a => a.name === 'send_announcement')) {
-    const targetChan = welcomeMsgMatch[1].replace('#', '');
-    actions.push({
-      name: 'send_announcement',
-      args: {
-        channelName: targetChan,
-        title: '🎉 Welcome to Club EZKEN!',
-        description: 'Welcome to the official **Club EZKEN** server! Comms, scrims, leveling, and private temp VCs are all active. Enjoy your stay!',
-        colorHex: '#E50914',
-      },
-    });
-  }
-
   return actions;
 }
 
 // -----------------------------------------------------------------------------
-// GEMINI FUNCTION DECLARATIONS
+// GEMINI FUNCTION DECLARATIONS (SUPER-ADMIN DISCORD BRAIN)
 // -----------------------------------------------------------------------------
+
+const disablePushToTalkDeclaration: FunctionDeclaration = {
+  name: 'disable_push_to_talk',
+  description: 'Disables forced push-to-talk across the Discord server and all voice channels so all members can talk normally with Voice Activity Detection (open mic / VAD). Updates @everyone and tier roles, and removes USE_VAD deny overwrites on voice channels.',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      targetChannels: { type: Type.STRING, description: '"all" or specific voice channel name' },
+      reason: { type: Type.STRING, description: 'Reason for enabling voice activity' },
+    },
+  },
+};
+
+const editChannelPermissionsDeclaration: FunctionDeclaration = {
+  name: 'edit_channel_permissions',
+  description: 'Configure allow and deny permissions for a role or member on a specific channel',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      channelName: { type: Type.STRING, description: 'Channel name, e.g. "general", "lounge-vc"' },
+      channelId: { type: Type.STRING, description: 'Optional channel ID' },
+      targetName: { type: Type.STRING, description: 'Role or member name, e.g. "@everyone", "Member", or username' },
+      targetId: { type: Type.STRING, description: 'Optional role or member ID' },
+      targetType: { type: Type.STRING, description: '"role" or "member"' },
+      allow: { type: Type.STRING, description: 'Permission bitfield string to allow' },
+      deny: { type: Type.STRING, description: 'Permission bitfield string to deny' },
+    },
+    required: ['targetName'],
+  },
+};
+
+const bulkEditChannelPermissionsDeclaration: FunctionDeclaration = {
+  name: 'bulk_edit_channel_permissions',
+  description: 'Batch update permissions across all voice channels or all text channels for a role',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      channelType: { type: Type.STRING, description: '"voice", "text", or "all"' },
+      targetName: { type: Type.STRING, description: 'Role name e.g. "@everyone", "Member"' },
+      allow: { type: Type.STRING, description: 'Permission bitfield string to allow' },
+      deny: { type: Type.STRING, description: 'Permission bitfield string to deny' },
+    },
+    required: ['channelType', 'targetName'],
+  },
+};
 
 const createRoleDeclaration: FunctionDeclaration = {
   name: 'create_role',
@@ -3723,10 +4168,11 @@ const createRoleDeclaration: FunctionDeclaration = {
       colorHex: { type: Type.STRING, description: 'Hex color code e.g. "#E50914", "#FBBF24", "#38BDF8"' },
       levelPerk: { type: Type.INTEGER, description: 'Optional level tier to unlock this role, e.g. 10, 25, 50' },
       mentionable: { type: Type.BOOLEAN, description: 'Whether role is mentionable by members' },
-      hoist: { type: Type.BOOLEAN, description: 'Display role separately in member list' }
+      hoist: { type: Type.BOOLEAN, description: 'Display role separately in member list' },
+      permissions: { type: Type.STRING, description: 'Optional permission bitfield string' },
     },
-    required: ['name']
-  }
+    required: ['name'],
+  },
 };
 
 const deleteRoleDeclaration: FunctionDeclaration = {
@@ -3736,10 +4182,28 @@ const deleteRoleDeclaration: FunctionDeclaration = {
     type: Type.OBJECT,
     properties: {
       name: { type: Type.STRING, description: 'Name of the role to delete' },
-      roleId: { type: Type.STRING, description: 'Optional ID of the role' }
+      roleId: { type: Type.STRING, description: 'Optional ID of the role' },
     },
-    required: ['name']
-  }
+    required: ['name'],
+  },
+};
+
+const editRoleDeclaration: FunctionDeclaration = {
+  name: 'edit_role',
+  description: 'Edit an existing role (name, color, hoist, mentionable, or permissions bitfield)',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      name: { type: Type.STRING, description: 'Existing role name' },
+      roleId: { type: Type.STRING, description: 'Optional role ID' },
+      newName: { type: Type.STRING, description: 'New name for the role' },
+      colorHex: { type: Type.STRING, description: 'New hex color code' },
+      hoist: { type: Type.BOOLEAN, description: 'Display role separately' },
+      mentionable: { type: Type.BOOLEAN, description: 'Allow role to be mentioned' },
+      permissions: { type: Type.STRING, description: 'New permission bitfield string' },
+    },
+    required: ['name'],
+  },
 };
 
 const createChannelDeclaration: FunctionDeclaration = {
@@ -3749,12 +4213,15 @@ const createChannelDeclaration: FunctionDeclaration = {
     type: Type.OBJECT,
     properties: {
       name: { type: Type.STRING, description: 'Channel name, e.g. "tournament-chat", "squad-lounge"' },
-      type: { type: Type.STRING, description: '"text", "voice", "category", or "announcement"' },
+      type: { type: Type.STRING, description: '"text", "voice", "category", "announcement", or "stage"' },
       topic: { type: Type.STRING, description: 'Channel topic or description' },
-      parentId: { type: Type.STRING, description: 'Optional category ID to place this channel in' }
+      parentId: { type: Type.STRING, description: 'Optional category ID to place this channel in' },
+      parentName: { type: Type.STRING, description: 'Optional category name to place this channel in' },
+      rateLimitPerUser: { type: Type.INTEGER, description: 'Slowmode seconds' },
+      userLimit: { type: Type.INTEGER, description: 'Voice channel user limit' },
     },
-    required: ['name']
-  }
+    required: ['name'],
+  },
 };
 
 const deleteChannelDeclaration: FunctionDeclaration = {
@@ -3764,24 +4231,86 @@ const deleteChannelDeclaration: FunctionDeclaration = {
     type: Type.OBJECT,
     properties: {
       name: { type: Type.STRING, description: 'Name of the channel to delete, e.g. "tournament-chat"' },
-      channelId: { type: Type.STRING, description: 'Optional channel ID' }
+      channelId: { type: Type.STRING, description: 'Optional channel ID' },
     },
-    required: ['name']
-  }
+    required: ['name'],
+  },
 };
 
-const assignLevelTierDeclaration: FunctionDeclaration = {
-  name: 'assign_level_tier',
-  description: 'Assign a title and reward tier to the XP leveling system at a specific level',
+const editChannelDeclaration: FunctionDeclaration = {
+  name: 'edit_channel',
+  description: 'Modify an existing channel (name, topic, slowmode, user limit, bitrate, nsfw, or category)',
   parameters: {
     type: Type.OBJECT,
     properties: {
-      level: { type: Type.INTEGER, description: 'Level requirement, e.g. 1, 5, 10, 25, 50, 100' },
-      tierName: { type: Type.STRING, description: 'Name of the perk title, e.g. "Crimson General"' },
-      colorHex: { type: Type.STRING, description: 'Hex color code for the badge/rank card' }
+      name: { type: Type.STRING, description: 'Current channel name to modify' },
+      channelId: { type: Type.STRING, description: 'Optional channel ID' },
+      newName: { type: Type.STRING, description: 'New channel name' },
+      topic: { type: Type.STRING, description: 'Channel topic description' },
+      rateLimitPerUser: { type: Type.INTEGER, description: 'Slowmode seconds (0 to disable)' },
+      userLimit: { type: Type.INTEGER, description: 'Voice channel user limit (0 for unlimited)' },
+      bitrate: { type: Type.INTEGER, description: 'Voice channel bitrate (e.g. 64000, 96000)' },
+      nsfw: { type: Type.BOOLEAN, description: 'Whether channel is age-restricted (NSFW)' },
+      parentName: { type: Type.STRING, description: 'Category name to place the channel in' },
     },
-    required: ['level', 'tierName']
-  }
+    required: ['name'],
+  },
+};
+
+const listMembersDeclaration: FunctionDeclaration = {
+  name: 'list_members',
+  description: 'List members in the Discord server with their username, ID, and assigned roles',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      limit: { type: Type.INTEGER, description: 'Number of members to return (max 100, default 25)' },
+    },
+  },
+};
+
+const editMemberDeclaration: FunctionDeclaration = {
+  name: 'edit_member',
+  description: 'Update a server member (change nickname, add/remove roles, server mute, server deafen)',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      userId: { type: Type.STRING, description: 'Discord User ID' },
+      nickname: { type: Type.STRING, description: 'New server nickname' },
+      rolesToAdd: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Names of roles to grant' },
+      rolesToRemove: { type: Type.ARRAY, items: { type: Type.STRING }, description: 'Names of roles to remove' },
+      mute: { type: Type.BOOLEAN, description: 'Server mute voice state' },
+      deaf: { type: Type.BOOLEAN, description: 'Server deafen voice state' },
+    },
+    required: ['userId'],
+  },
+};
+
+const moderateMemberDeclaration: FunctionDeclaration = {
+  name: 'moderate_member',
+  description: 'Timeout, untimeout, kick, ban, or unban a member from the Discord server',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      userId: { type: Type.STRING, description: 'Discord User ID' },
+      action: { type: Type.STRING, description: '"TIMEOUT", "UNTIMEOUT", "KICK", "BAN", or "UNBAN"' },
+      reason: { type: Type.STRING, description: 'Reason for the moderation action' },
+      durationMinutes: { type: Type.INTEGER, description: 'Timeout duration in minutes (default 60)' },
+    },
+    required: ['userId', 'action'],
+  },
+};
+
+const purgeMessagesDeclaration: FunctionDeclaration = {
+  name: 'purge_messages',
+  description: 'Bulk delete messages from a channel (1 to 100 messages)',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      channelName: { type: Type.STRING, description: 'Channel to purge messages from' },
+      count: { type: Type.INTEGER, description: 'Number of messages to delete (1-100)' },
+    },
+    required: ['channelName', 'count'],
+  },
 };
 
 const sendAnnouncementDeclaration: FunctionDeclaration = {
@@ -3793,37 +4322,114 @@ const sendAnnouncementDeclaration: FunctionDeclaration = {
       channelName: { type: Type.STRING, description: 'Target channel name, e.g. "announcements", "general"' },
       title: { type: Type.STRING, description: 'Title of the announcement' },
       description: { type: Type.STRING, description: 'Content/body of the announcement' },
-      colorHex: { type: Type.STRING, description: 'Hex color accent e.g. "#E50914"' }
+      colorHex: { type: Type.STRING, description: 'Hex color accent e.g. "#E50914"' },
     },
-    required: ['title', 'description']
-  }
+    required: ['title', 'description'],
+  },
 };
 
-const moderateMemberDeclaration: FunctionDeclaration = {
-  name: 'moderate_member',
-  description: 'Timeout, kick, ban, or unban a member from the Discord server',
+const sendMessageDeclaration: FunctionDeclaration = {
+  name: 'send_message',
+  description: 'Send a regular message or styled card into any text channel',
   parameters: {
     type: Type.OBJECT,
     properties: {
-      userId: { type: Type.STRING, description: 'Discord User ID' },
-      action: { type: Type.STRING, description: '"TIMEOUT", "KICK", "BAN", or "UNBAN"' },
-      reason: { type: Type.STRING, description: 'Reason for the moderation action' },
-      durationMinutes: { type: Type.INTEGER, description: 'Timeout duration in minutes (default 60)' }
+      channelName: { type: Type.STRING, description: 'Target channel name' },
+      content: { type: Type.STRING, description: 'Message text content' },
+      embedTitle: { type: Type.STRING, description: 'Optional embed title' },
+      embedDescription: { type: Type.STRING, description: 'Optional embed description' },
+      colorHex: { type: Type.STRING, description: 'Optional embed color' },
     },
-    required: ['userId', 'action']
-  }
+    required: ['channelName'],
+  },
 };
+
+const getGuildInfoDeclaration: FunctionDeclaration = {
+  name: 'get_guild_info',
+  description: 'Retrieve current server statistics, boost level, verification level, and configuration',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {},
+  },
+};
+
+const editGuildDeclaration: FunctionDeclaration = {
+  name: 'edit_guild',
+  description: 'Edit server-wide settings (server name, verification level, explicit content filter, default notifications)',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      name: { type: Type.STRING, description: 'New server name' },
+      verificationLevel: { type: Type.INTEGER, description: '0=None, 1=Low, 2=Medium, 3=High, 4=Highest' },
+      defaultMessageNotifications: { type: Type.INTEGER, description: '0=All Messages, 1=Only Mentions' },
+      explicitContentFilter: { type: Type.INTEGER, description: '0=Disabled, 1=Members Without Roles, 2=All Members' },
+    },
+  },
+};
+
+const assignLevelTierDeclaration: FunctionDeclaration = {
+  name: 'assign_level_tier',
+  description: 'Assign a title and reward tier to the XP leveling system at a specific level',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      level: { type: Type.INTEGER, description: 'Level requirement, e.g. 1, 5, 10, 25, 50, 100' },
+      tierName: { type: Type.STRING, description: 'Name of the perk title, e.g. "Crimson General"' },
+      colorHex: { type: Type.STRING, description: 'Hex color code for the badge/rank card' },
+    },
+    required: ['level', 'tierName'],
+  },
+};
+
+const getServerOverviewDeclaration: FunctionDeclaration = {
+  name: 'get_server_overview',
+  description: 'Live comprehensive audit of all channels, categories, roles, and member stats in Club EZKEN',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {},
+  },
+};
+
+// All available super-admin tools for Gemini
+const allSuperAdminTools = [{
+  functionDeclarations: [
+    disablePushToTalkDeclaration,
+    editChannelPermissionsDeclaration,
+    bulkEditChannelPermissionsDeclaration,
+    createRoleDeclaration,
+    deleteRoleDeclaration,
+    editRoleDeclaration,
+    createChannelDeclaration,
+    deleteChannelDeclaration,
+    editChannelDeclaration,
+    listMembersDeclaration,
+    moderateMemberDeclaration,
+    editMemberDeclaration,
+    sendAnnouncementDeclaration,
+    sendMessageDeclaration,
+    purgeMessagesDeclaration,
+    getGuildInfoDeclaration,
+    editGuildDeclaration,
+    assignLevelTierDeclaration,
+    getServerOverviewDeclaration,
+  ],
+}];
 
 // In-memory deduplication cache: prevents duplicate execution if user double-submits or network retries
 const recentPromptExecutions = new Map<string, { timestamp: number; responseData: any }>();
 
 // -----------------------------------------------------------------------------
-// POST /api/gemini/architect - Autonomous Gemini AI Engine (with Image Upload)
+// POST /api/gemini/architect - Autonomous Gemini AI Engine (Multi-Turn Chat Memory)
 // -----------------------------------------------------------------------------
 app.post('/api/gemini/architect', async (req: Request, res: Response) => {
   const reqStartTime = Date.now();
   try {
-    const { prompt, imageBase64, imageMimeType } = req.body;
+    const { prompt, history: incomingHistory, imageBase64, imageMimeType, clearHistory } = req.body;
+
+    if (clearHistory) {
+      aiChatMemory.length = 0;
+      return res.json({ message: 'Conversation memory cleared successfully!', cleared: true });
+    }
 
     if (!prompt || typeof prompt !== 'string') {
       return res.status(400).json({ error: 'Prompt is required.' });
@@ -3837,28 +4443,24 @@ app.post('/api/gemini/architect', async (req: Request, res: Response) => {
       return res.json(cached.responseData);
     }
 
-    // Fetch current live channels and roles from Discord for live grounding
+    // Fetch current live channels and roles from Discord for real-time live grounding
     const currentChannels = await fetchGuildChannels();
     const currentRoles = await fetchGuildRoles();
 
-  const executedActions: ActionReceipt[] = [];
-  const tools = [{
-    functionDeclarations: [
-      createRoleDeclaration,
-      deleteRoleDeclaration,
-      createChannelDeclaration,
-      deleteChannelDeclaration,
-      assignLevelTierDeclaration,
-      sendAnnouncementDeclaration,
-      moderateMemberDeclaration,
-    ]
-  }];
+    const executedActions: ActionReceipt[] = [];
 
-  const channelNamesList = currentChannels.map(c => `#${c.name} (type:${c.type})`).slice(0, 30).join(', ');
-  const roleNamesList = currentRoles.map(r => `@${r.name}`).slice(0, 25).join(', ');
+    const channelNamesList = currentChannels
+      .map(c => `#${c.name} (type:${c.type === 2 ? 'VOICE' : c.type === 4 ? 'CATEGORY' : 'TEXT'}, id:${c.id})`)
+      .slice(0, 40)
+      .join(', ');
 
-  const systemInstruction = `You are the Autonomous Discord Server Architect and Super Admin AI for "Club EZKEN" (Guild ID: ${DISCORD_GUILD_ID}).
-You have FULL, UNRESTRICTED ACCESS to modify the Discord server in real-time.
+    const roleNamesList = currentRoles
+      .map(r => `@${r.name} (id:${r.id})`)
+      .slice(0, 35)
+      .join(', ');
+
+    const systemInstruction = `You are the Autonomous Discord Server Architect and Master Super Admin AI for "Club EZKEN" (Guild ID: ${DISCORD_GUILD_ID}).
+You have FULL, UNRESTRICTED ADMINISTRATOR ACCESS to execute real-time modifications directly on the live Discord server through your tools.
 The bot in the server is named "ClubEZ" and has full administrator permissions.
 
 CURRENT DISCORD SERVER CHANNELS:
@@ -3870,93 +4472,144 @@ ${roleNamesList || 'Owner, Moderator, Member'}
 CURRENT XP LEVEL TIERS:
 ${Object.entries(levelTiers).map(([lvl, t]) => `Level ${lvl}: ${t.name} (${t.color})`).join(', ')}
 
-YOUR DIRECTIVES:
-1. When asked to create, delete, or manage roles, channels, levels, announcements, or members, you MUST CALL the appropriate functions immediately!
-​2. You have authority to perform multiple actions at once (e.g. create a role, map it to a level tier, and create a channel for it).
-3. Use Club EZKEN's red (#E50914), dark (#12161E), and gold (#FBBF24) aesthetic colors.
-4. Always provide an enthusiastic, clear response confirming what was created, deleted, or modified on Discord.`;
+CORE DISCORD EXPERTISE & DIRECTIVES:
+1. PUSH-TO-TALK & VOICE ACTIVITY DETECTION (VAD):
+   - When asked to disable push-to-talk, fix voice chat, allow normal talking, or enable open mic / voice activity detection, CALL "disable_push_to_talk" IMMEDIATELY!
+   - In Discord, forced push-to-talk happens when the permission "USE_VAD" (Voice Activity Detection, bit 33554432) is denied or not granted. Calling "disable_push_to_talk" fixes this across @everyone, leveling roles, and all voice channels!
+   - DO NOT create a new channel when the user is asking about voice chat permissions or push-to-talk!
 
-  let aiMessage = '';
-  let modelWorked = false;
-  let activeModelUsed = 'Gemini 3.1 Flash Lite';
+2. PERMISSION MANAGEMENT:
+   - You can edit channel permissions for any role or member using "edit_channel_permissions" or "bulk_edit_channel_permissions".
+   - Key permission bit flags:
+     * USE_VAD: 33554432 (Use Voice Activity)
+     * SPEAK: 2097152 (Speak in Voice)
+     * CONNECT: 1048576 (Connect to Voice)
+     * SEND_MESSAGES: 2048
+     * VIEW_CHANNEL: 1024
+     * ATTACH_FILES: 32768
+     * EMBED_LINKS: 16384
+     * USE_EXTERNAL_EMOJIS: 262144
+     * MANAGE_MESSAGES: 8192
 
-  // Fast model priority: gemini-3.1-flash-lite (~800ms) -> gemini-3.5-flash (~1.7s) -> gemini-3.8-flash
-  const candidateModels = ['gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash'];
+3. CHANNEL & ROLE MANAGEMENT:
+   - You can create, edit, rename, and delete any channel ("create_channel", "edit_channel", "delete_channel").
+   - You can create, edit, recolor, and delete any role ("create_role", "edit_role", "delete_role").
+   - You can moderate members ("moderate_member": TIMEOUT, UNTIMEOUT, KICK, BAN, UNBAN) or update nicknames and roles ("edit_member").
+   - You can purge messages ("purge_messages") or broadcast announcements ("send_announcement", "send_message").
 
-  if (aiClient) {
-    // Build multimodal content (text + optional image)
-    let contents: any;
-    if (imageBase64 && imageMimeType) {
-      contents = [
-        {
-          role: 'user',
-          parts: [
-            {
-              inlineData: {
-                data: imageBase64,
-                mimeType: imageMimeType,
-              },
-            },
-            { text: prompt },
-          ],
-        },
-      ];
-    } else {
-      contents = prompt;
-    }
+4. CONVERSATION CONTEXT & INTELLIGENCE:
+   - You have full conversational memory of what you did in previous turns! When the user says "do it", "undo that", "change its color to blue", "also do that for the voice channels", refer to previously discussed channels, roles, and actions!
+   - Always call the necessary tools first, then give an enthusiastic, professional confirmation of what was changed on the live server.`;
 
-    for (const modelName of candidateModels) {
-      try {
-        const response = await aiClient.models.generateContent({
-          model: modelName,
-          contents,
-          config: {
-            systemInstruction,
-            tools,
-          },
-        });
+    let aiMessage = '';
+    let modelWorked = false;
+    let activeModelUsed = 'Gemini 3.8 Flash';
 
-        const calls = response.functionCalls || [];
-        for (const call of calls) {
-          const receipt = await executeServerAction(call.name || '', call.args || {}, currentChannels, currentRoles);
-          executedActions.push(receipt);
+    const candidateModels = ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.1-flash-lite'];
+
+    if (aiClient) {
+      // Build multi-turn conversational contents array
+      const contents: Array<{ role: string; parts: any[] }> = [];
+
+      // 1. Incorporate prior history if provided by frontend, or fallback to in-memory server buffer
+      const historyToUse = Array.isArray(incomingHistory) && incomingHistory.length > 0
+        ? incomingHistory
+        : aiChatMemory;
+
+      if (Array.isArray(historyToUse) && historyToUse.length > 0) {
+        // Sanitize: ensure valid roles ('user' or 'model') and starts with 'user'
+        const sanitizedTurns: Array<{ role: string; parts: any[] }> = [];
+        for (const item of historyToUse) {
+          const role = (item.role === 'user' ? 'user' : 'model');
+          const textContent = typeof item.content === 'string' ? item.content : (item.parts?.[0]?.text || '');
+          if (textContent && textContent.trim()) {
+            sanitizedTurns.push({ role, parts: [{ text: textContent }] });
+          }
         }
 
-        aiMessage = response.text || '';
-        modelWorked = true;
-        activeModelUsed = modelName === 'gemini-3.1-flash-lite'
-          ? 'Gemini 3.1 Flash Lite'
-          : modelName === 'gemini-3.5-flash'
-          ? 'Gemini 3.5 Flash'
-          : 'Gemini 3.8 Flash';
-        console.log(`[AI ARCHITECT] Successfully answered via ${activeModelUsed} in ${Date.now() - reqStartTime}ms with ${calls.length} action(s)`);
-        break;
-      } catch (modelErr: any) {
-        console.warn(`[AI ARCHITECT] ${modelName} warning: ${modelErr.message}`);
+        // Gemini requires the conversation to start with 'user'
+        while (sanitizedTurns.length > 0 && sanitizedTurns[0].role !== 'user') {
+          sanitizedTurns.shift();
+        }
+
+        // Keep last 16 historical turns so context is fresh and fast
+        for (const turn of sanitizedTurns.slice(-16)) {
+          contents.push(turn);
+        }
+      }
+
+      // 2. Append the current user turn (with optional image)
+      const currentParts: any[] = [];
+      if (imageBase64 && imageMimeType) {
+        currentParts.push({
+          inlineData: {
+            data: imageBase64,
+            mimeType: imageMimeType,
+          },
+        });
+      }
+      currentParts.push({ text: prompt });
+      contents.push({ role: 'user', parts: currentParts });
+
+      for (const modelName of candidateModels) {
+        try {
+          const response = await aiClient.models.generateContent({
+            model: modelName,
+            contents,
+            config: {
+              systemInstruction,
+              tools: allSuperAdminTools,
+            },
+          });
+
+          const calls = response.functionCalls || [];
+          for (const call of calls) {
+            const receipt = await executeServerAction(call.name || '', call.args || {}, currentChannels, currentRoles);
+            executedActions.push(receipt);
+          }
+
+          aiMessage = response.text || '';
+          modelWorked = true;
+          activeModelUsed = modelName === 'gemini-3.8-flash'
+            ? 'Gemini 3.8 Flash'
+            : modelName === 'gemini-3.5-flash'
+            ? 'Gemini 3.5 Flash'
+            : 'Gemini 3.1 Flash Lite';
+          console.log(`[AI ARCHITECT] Successfully answered via ${activeModelUsed} in ${Date.now() - reqStartTime}ms with ${calls.length} action(s)`);
+          break;
+        } catch (modelErr: any) {
+          console.warn(`[AI ARCHITECT] ${modelName} warning: ${modelErr.message}`);
+        }
       }
     }
-  }
 
-  // If tool calls were not executed by Gemini (or if models were rate-limited / 503 high demand),
-  // apply our deterministic intent parser to ensure the user's command ALWAYS executes on Discord!
-  if (executedActions.length === 0) {
-    const parsedActions = parseNaturalLanguageIntent(prompt);
-    for (const action of parsedActions) {
-      const receipt = await executeServerAction(action.name, action.args, currentChannels, currentRoles);
-      executedActions.push(receipt);
+    // If tool calls were not executed by Gemini (or if models were rate-limited / high demand),
+    // apply our deterministic intent parser to guarantee the user's request ALWAYS executes!
+    if (executedActions.length === 0) {
+      const parsedActions = parseNaturalLanguageIntent(prompt);
+      for (const action of parsedActions) {
+        const receipt = await executeServerAction(action.name, action.args, currentChannels, currentRoles);
+        executedActions.push(receipt);
+      }
     }
-  }
 
-  if (executedActions.length > 0) {
-    const successList = executedActions.filter(a => a.success).map(a => a.result);
-    if (!aiMessage) {
-      aiMessage = `⚡ Done! I have directly updated your Discord server:\n` +
-        successList.map(s => `• ${s}`).join('\n') +
-        `\n\nAll changes are live in Club EZKEN right now!`;
+    if (executedActions.length > 0) {
+      const successList = executedActions.filter(a => a.success).map(a => a.result);
+      if (!aiMessage) {
+        aiMessage = `⚡ Done! I have directly updated your Discord server:\n` +
+          successList.map(s => `• ${s}`).join('\n') +
+          `\n\nAll changes are live in Club EZKEN right now!`;
+      }
+    } else if (!aiMessage) {
+      aiMessage = `I've analyzed your server Club EZKEN (Guild ID: ${DISCORD_GUILD_ID}). Your server has ${currentChannels.length} channels and ${currentRoles.length} roles. Let me know what you would like to build or modify — e.g. "Disable Push-to-Talk so everyone can talk normally", "Create a VIP role with gold color at level 25", or "Delete channel tournament-chat"!`;
     }
-  } else if (!aiMessage) {
-    aiMessage = `I've analyzed your server Club EZKEN (Guild ID: ${DISCORD_GUILD_ID}). Your server has ${currentChannels.length} channels and ${currentRoles.length} roles. Let me know what you would like to build or modify — e.g. "Create a VIP role with gold color at level 25", "Create text channel scrims-chat", or "Delete channel tournament-chat"!`;
-  }
+
+    // Save turn to persistent server-side conversation memory
+    aiChatMemory.push({ role: 'user', parts: [{ text: prompt }] });
+    aiChatMemory.push({ role: 'model', parts: [{ text: aiMessage }] });
+    if (aiChatMemory.length > AI_MEMORY_MAX_TURNS) {
+      aiChatMemory.splice(0, aiChatMemory.length - AI_MEMORY_MAX_TURNS);
+    }
 
     const responsePayload = {
       message: aiMessage,
@@ -3972,7 +4625,7 @@ YOUR DIRECTIVES:
         groundedRoles: currentRoles.length,
         actionsCount: executedActions.length,
         durationMs: Date.now() - reqStartTime,
-      }
+      },
     };
 
     // Store in short-lived deduplication cache
@@ -3983,6 +4636,12 @@ YOUR DIRECTIVES:
     console.error('[AI ARCHITECT ERROR]', err?.stack || err?.message || err);
     return res.status(500).json({ error: err?.message || 'AI Architect failed. Please try again.' });
   }
+});
+
+// Endpoint to explicitly clear server-side chat memory
+app.post('/api/gemini/clear-memory', (req: Request, res: Response) => {
+  aiChatMemory.length = 0;
+  return res.json({ success: true, message: 'AI Chat Memory successfully cleared.' });
 });
 
 // -----------------------------------------------------------------------------
