@@ -4865,9 +4865,9 @@ CONFIRMATION & COLLABORATION PROTOCOL:
       }
     }
 
-    // If tool calls were not executed by Gemini (or if models were rate-limited / high demand),
-    // apply our deterministic intent parser to guarantee the user's request ALWAYS executes!
-    if (executedActions.length === 0) {
+    // If Gemini was offline, rate-limited, or failed to respond,
+    // apply our deterministic intent parser as emergency fallback to ensure actions can still execute!
+    if (!modelWorked && executedActions.length === 0) {
       const parsedActions = parseNaturalLanguageIntent(prompt);
       for (const action of parsedActions) {
         const receipt = await executeServerAction(action.name, action.args, currentChannels, currentRoles);
