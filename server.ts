@@ -3530,6 +3530,58 @@ async function executeServerAction(actionName: string, args: any, currentChannel
       };
     }
 
+    if (actionName === 'check_voice_permissions' || actionName === 'check_push_to_talk') {
+      const USE_VAD_BIT = 33554432n;
+      const SPEAK_BIT = 2097152n;
+      const CONNECT_BIT = 1048576n;
+
+      const everyoneRole = currentRoles.find(r => r.id === DISCORD_GUILD_ID || r.name === '@everyone');
+      const everyoneBits = BigInt(everyoneRole?.permissions || '0');
+      const everyoneHasVAD = (everyoneBits & USE_VAD_BIT) !== 0n;
+      const everyoneHasSpeak = (everyoneBits & SPEAK_BIT) !== 0n;
+
+      let liveChannels = currentChannels;
+      try {
+        const chanRes = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/channels`, {
+          headers: getDiscordHeaders(),
+        });
+        if (chanRes.ok) liveChannels = await chanRes.json();
+      } catch {}
+
+      const voiceChannels = liveChannels.filter((c: any) => c.type === 2 || c.type === 13);
+      const channelsWithForcedPTT: string[] = [];
+      const channelsWithOpenMic: string[] = [];
+
+      for (const vc of voiceChannels) {
+        const overwrites = Array.isArray(vc.permission_overwrites) ? vc.permission_overwrites : [];
+        const everyoneOw = overwrites.find((o: any) => o.id === DISCORD_GUILD_ID);
+        const deniesVAD = everyoneOw && (BigInt(everyoneOw.deny || '0') & USE_VAD_BIT) !== 0n;
+        if (deniesVAD) {
+          channelsWithForcedPTT.push(vc.name);
+        } else {
+          channelsWithOpenMic.push(vc.name);
+        }
+      }
+
+      const pttRequired = !everyoneHasVAD || channelsWithForcedPTT.length > 0;
+      return {
+        action: 'CHECKED_VOICE_PERMISSIONS',
+        details: {
+          pushToTalkRequired: pttRequired,
+          everyoneHasVoiceActivity: everyoneHasVAD,
+          everyoneHasSpeak,
+          totalVoiceChannels: voiceChannels.length,
+          openMicChannelsCount: channelsWithOpenMic.length,
+          forcedPttChannelsCount: channelsWithForcedPTT.length,
+          forcedPttChannels: channelsWithForcedPTT,
+        },
+        result: pttRequired
+          ? `⚠️ Push-to-Talk IS CURRENTLY REQUIRED on ${channelsWithForcedPTT.length} voice channel(s): ${channelsWithForcedPTT.join(', ')}. Members cannot talk freely without holding a button in those rooms.`
+          : `✅ NO, push-to-talk is NOT required in the server! Voice Activity Detection (open mic) is enabled server-wide on @everyone and across all ${voiceChannels.length} voice channels. Everyone can talk normally without holding any key.`,
+        success: true,
+      };
+    }
+
     if (actionName === 'get_server_overview') {
       const liveChannels = await fetchGuildChannels();
       const liveRoles = await fetchGuildRoles();
@@ -3993,16 +4045,27 @@ function parseNaturalLanguageIntent(prompt: string): Array<{ name: string; args:
   const text = prompt.trim();
   const lower = text.toLowerCase();
 
-  // 0. PRIORITY 1: Push-to-Talk / Normal Voice Activity Intent
+  // 0. PRIORITY 1: Push-to-Talk / Voice Activity Intent
+  const isPttQuestion = /(?:check|is|does|do|why|how|what|are|has|have).*?(?:push\s*to\s*talk|ptt|talk\s*normally|voice\s*activity|open\s*mic)/i.test(text) ||
+    (/(?:push\s*to\s*talk|ptt|voice\s*activity)/i.test(text) && (text.includes('?') || /(?:check|status|needed|required|enabled)/i.test(text)));
+
+  if (isPttQuestion) {
+    actions.push({
+      name: 'check_voice_permissions',
+      args: {},
+    });
+    return actions;
+  }
+
   // User wants to disable forced PTT, enable voice activity, let members talk normally
   if (
-    /push\s*to\s*talk|ptt|talk\s*normally|voice\s*activity|open\s*mic|can'?t\s*talk\s*in\s*v(?:c|oice)|allow.*(?:talk|speak)|disable.*push|enable.*(?:talk|vad)|remove.*push/i.test(text)
+    /push\s*to\s*talk|ptt|talk\s*normally|voice\s*activity|open\s*mic|can'?t\s*talk\s*in\s*v(?:c|oice)|allow.*(?:talk|speak)|disable.*push|enable.*(?:talk|vad)|remove.*push|fix.*(?:voice|talk|mic)/i.test(text)
   ) {
     actions.push({
       name: 'disable_push_to_talk',
       args: { targetChannels: 'all' },
     });
-    return actions; // Immediately return to prevent false channel creation!
+    return actions;
   }
 
   // 1. Server Overview / Audit
@@ -4112,6 +4175,15 @@ function parseNaturalLanguageIntent(prompt: string): Array<{ name: string; args:
 // -----------------------------------------------------------------------------
 // GEMINI FUNCTION DECLARATIONS (SUPER-ADMIN DISCORD BRAIN)
 // -----------------------------------------------------------------------------
+
+const checkVoicePermissionsDeclaration: FunctionDeclaration = {
+  name: 'check_voice_permissions',
+  description: 'Check whether Push-to-Talk is currently required or if Voice Activity Detection (open mic) is enabled for members across the server and voice channels',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {},
+  },
+};
 
 const disablePushToTalkDeclaration: FunctionDeclaration = {
   name: 'disable_push_to_talk',
@@ -4393,6 +4465,7 @@ const getServerOverviewDeclaration: FunctionDeclaration = {
 // All available super-admin tools for Gemini
 const allSuperAdminTools = [{
   functionDeclarations: [
+    checkVoicePermissionsDeclaration,
     disablePushToTalkDeclaration,
     editChannelPermissionsDeclaration,
     bulkEditChannelPermissionsDeclaration,
@@ -4565,12 +4638,58 @@ CORE DISCORD EXPERTISE & DIRECTIVES:
           });
 
           const calls = response.functionCalls || [];
-          for (const call of calls) {
-            const receipt = await executeServerAction(call.name || '', call.args || {}, currentChannels, currentRoles);
-            executedActions.push(receipt);
+          if (calls.length > 0) {
+            const toolResponseParts: any[] = [];
+            for (const call of calls) {
+              const receipt = await executeServerAction(call.name || '', call.args || {}, currentChannels, currentRoles);
+              executedActions.push(receipt);
+              toolResponseParts.push({
+                functionResponse: {
+                  name: call.name,
+                  response: {
+                    output: receipt.result,
+                    success: receipt.success,
+                    details: receipt.details,
+                  },
+                },
+              });
+            }
+
+            // Round 2: Feed function execution outputs back to Gemini so it writes a natural, intelligent human response!
+            try {
+              const candidateContent = response.candidates?.[0]?.content;
+              const modelCallTurn = candidateContent || {
+                role: 'model',
+                parts: calls.map(c => ({ functionCall: c })),
+              };
+
+              const round2Contents = [
+                ...contents,
+                modelCallTurn,
+                {
+                  role: 'user',
+                  parts: toolResponseParts,
+                },
+              ];
+
+              const round2Response = await aiClient.models.generateContent({
+                model: modelName,
+                contents: round2Contents,
+                config: {
+                  systemInstruction: systemInstruction + `\n\nCRITICAL DIRECTIVE: Speak like a helpful, smart, expert human Discord server moderator. Answer the user's question directly in a natural, friendly tone based on the tool results. If they asked to check something (e.g. "does everyone need push to talk?"), give them a direct, clear answer ("No, everyone has open mic enabled..."). Never output a robotic template!`,
+                },
+              });
+
+              if (round2Response.text && round2Response.text.trim()) {
+                aiMessage = round2Response.text.trim();
+              }
+            } catch (r2Err: any) {
+              console.warn('[AI ARCHITECT] Round 2 generation error:', r2Err.message);
+            }
+          } else {
+            aiMessage = response.text || '';
           }
 
-          aiMessage = response.text || '';
           modelWorked = true;
           activeModelUsed = modelName === 'gemini-3.8-flash'
             ? 'Gemini 3.8 Flash'
@@ -4595,10 +4714,13 @@ CORE DISCORD EXPERTISE & DIRECTIVES:
       }
     }
 
-    if (executedActions.length > 0) {
+    if (executedActions.length > 0 && !aiMessage) {
       const successList = executedActions.filter(a => a.success).map(a => a.result);
-      if (!aiMessage) {
-        aiMessage = `⚡ Done! I have directly updated your Discord server:\n` +
+      const isQuestion = /(?:check|is|does|do|why|how|what|are|has|have|who)/i.test(prompt.trim()) || prompt.includes('?');
+      if (isQuestion) {
+        aiMessage = successList.join('\n\n');
+      } else {
+        aiMessage = `⚡ Done! I have updated your Discord server:\n` +
           successList.map(s => `• ${s}`).join('\n') +
           `\n\nAll changes are live in Club EZKEN right now!`;
       }
