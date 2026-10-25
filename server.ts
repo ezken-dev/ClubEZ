@@ -484,7 +484,7 @@ async function startNextMusicTrack(): Promise<void> {
         const stream = ytdlClient.download(next.url, {
           filter: (f: any) => f.hasAudio && !f.hasVideo && (f.container === 'webm' || f.codecs?.includes('opus')),
           quality: 'highestaudio',
-          highWaterMark: 1 << 25,
+          highWaterMark: 512 * 1024,
         });
 
         stream.on('error', (err: any) => {
@@ -514,7 +514,7 @@ async function startNextMusicTrack(): Promise<void> {
           const stream = ytdlClient.download(next.url, {
             filter: { hasAudio: true, hasVideo: false },
             quality: 'highestaudio',
-            highWaterMark: 1 << 25,
+            highWaterMark: 512 * 1024,
           });
 
           stream.on('error', (err: any) => {
@@ -6056,20 +6056,20 @@ app.get('/api/download-bot-zip', async (_req: Request, res: Response) => {
 // VITE MIDDLEWARE / PRODUCTION STATIC ASSETS
 // -----------------------------------------------------------------------------
 async function startServer() {
-  const isProd = process.env.NODE_ENV === 'production';
-
-  if (!isProd) {
-    const { createServer } = await import('vite');
-    const vite = await createServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(__dirname, 'dist');
+  const distPath = path.join(__dirname, 'dist');
+  if (fs.existsSync(distPath)) {
     app.use(express.static(distPath));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
+    });
+  } else {
+    app.get('/', (_req, res) => {
+      res.json({
+        status: 'online',
+        bot: 'ClubEZ',
+        message: 'ClubEZ API Server is running.',
+        timestamp: new Date().toISOString(),
+      });
     });
   }
 
