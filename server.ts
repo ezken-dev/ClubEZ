@@ -4423,6 +4423,7 @@ const recentPromptExecutions = new Map<string, { timestamp: number; responseData
 // -----------------------------------------------------------------------------
 app.post('/api/gemini/architect', async (req: Request, res: Response) => {
   const reqStartTime = Date.now();
+  console.log('[AI ARCHITECT] Received request with prompt:', req.body?.prompt?.slice(0, 60));
   try {
     const { prompt, history: incomingHistory, imageBase64, imageMimeType, clearHistory } = req.body;
 
@@ -4503,9 +4504,10 @@ CORE DISCORD EXPERTISE & DIRECTIVES:
 
     let aiMessage = '';
     let modelWorked = false;
-    let activeModelUsed = 'Gemini 3.8 Flash';
+    let activeModelUsed = 'Gemini 3.1 Flash Lite';
 
-    const candidateModels = ['gemini-3.8-flash', 'gemini-3.5-flash', 'gemini-3.1-flash-lite'];
+    // Fast model priority: gemini-3.1-flash-lite (~800ms) -> gemini-3.5-flash (~1.7s) -> gemini-3.8-flash
+    const candidateModels = ['gemini-3.1-flash-lite', 'gemini-3.5-flash', 'gemini-3.8-flash'];
 
     if (aiClient) {
       // Build multi-turn conversational contents array
