@@ -37,6 +37,9 @@ import {
   entersState,
 } from '@discordjs/voice';
 import * as play from 'play-dl';
+import ffmpegStatic from 'ffmpeg-static';
+import YouTube from 'youtube-sr';
+import { Ytdl } from '@distube/ytdl-core';
 
 import {
   handleTempVoiceVoiceStateUpdate,
@@ -63,6 +66,15 @@ dotenv.config();
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Configure FFmpeg binary path for audio encoding/decoding
+const ffmpegPath = (ffmpegStatic as any)?.default || ffmpegStatic;
+if (ffmpegPath && typeof ffmpegPath === 'string') {
+  process.env.FFMPEG_PATH = ffmpegPath;
+}
+
+// Resilient YouTube audio extraction client (v5.0.1)
+const ytdlClient = new Ytdl();
 
 const app = express();
 
@@ -375,17 +387,77 @@ function fromYouTubeVideo(video: any, requestedBy = 'Dashboard', source: 'youtub
 async function searchYouTube(query: string, limit = 5): Promise<MusicQueueItem[]> {
   const normalized = await normalizeMusicQuery(query);
   const isYouTubeUrl = /(?:youtube\.com|youtu\.be)/i.test(normalized.query);
+
   if (isYouTubeUrl) {
-    const info: any = await play.video_info(normalized.query);
-    return [fromYouTubeVideo(info.video_details, 'Dashboard', normalized.source)];
+    try {
+      const info = await ytdlClient.getInfo(normalized.query);
+      if (info?.videoDetails) {
+        const sec = Number(info.videoDetails.lengthSeconds) || 0;
+        return [{
+          id: info.videoDetails.videoId || `yt_${Date.now()}`,
+          title: info.videoDetails.title || 'YouTube Audio',
+          artist: info.videoDetails.author?.name || 'YouTube',
+          duration: formatTrackDuration(sec),
+          durationSec: sec,
+          thumbnail: info.videoDetails.thumbnails?.[0]?.url || (info.videoDetails.videoId ? `https://i.ytimg.com/vi/${info.videoDetails.videoId}/hqdefault.jpg` : ''),
+          url: normalized.query,
+          source: normalized.source,
+          requestedBy: 'Dashboard',
+          addedAt: Date.now(),
+        }];
+      }
+    } catch (e: any) {
+      console.warn('[YTDL GETINFO WARN]', e.message);
+    }
+
+    try {
+      const info: any = await play.video_info(normalized.query);
+      if (info?.video_details) {
+        return [fromYouTubeVideo(info.video_details, 'Dashboard', normalized.source)];
+      }
+    } catch (playErr: any) {
+      console.warn('[PLAY-DL VIDEO_INFO WARN]', playErr.message);
+    }
   }
-  const results = await play.search(normalized.query, {
-    limit,
-    source: { youtube: 'video' },
-  });
-  return results
-    .filter((video: any) => video?.url && video?.id && video.type === 'video')
-    .map((video: any) => fromYouTubeVideo(video, 'Dashboard', normalized.source));
+
+  // 1. Primary: youtube-sr for reliable title search
+  try {
+    const yt = (YouTube as any).default || YouTube;
+    const srResults = await yt.search(normalized.query, { limit, type: 'video' });
+    if (srResults && srResults.length > 0) {
+      return srResults.map((v: any) => ({
+        id: v.id || `yt_${Date.now()}`,
+        title: v.title || 'Untitled video',
+        artist: v.channel?.name || 'YouTube',
+        duration: v.durationFormatted || formatTrackDuration(Math.floor((v.duration || 0) / 1000)),
+        durationSec: Math.floor((v.duration || 0) / 1000),
+        thumbnail: v.thumbnail?.url || (v.id ? `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg` : ''),
+        url: v.url || `https://www.youtube.com/watch?v=${v.id}`,
+        source: normalized.source,
+        requestedBy: 'Dashboard',
+        addedAt: Date.now(),
+      }));
+    }
+  } catch (srErr: any) {
+    console.warn('[YOUTUBE-SR SEARCH WARN]', srErr.message);
+  }
+
+  // 2. Secondary: play-dl search fallback
+  try {
+    const results = await play.search(normalized.query, {
+      limit,
+      source: { youtube: 'video' },
+    });
+    if (results && results.length > 0) {
+      return results
+        .filter((video: any) => video?.url && video?.id && video.type === 'video')
+        .map((video: any) => fromYouTubeVideo(video, 'Dashboard', normalized.source));
+    }
+  } catch (playErr: any) {
+    console.warn('[PLAY-DL SEARCH WARN]', playErr.message);
+  }
+
+  return [];
 }
 
 async function startNextMusicTrack(): Promise<void> {
@@ -402,10 +474,21 @@ async function startNextMusicTrack(): Promise<void> {
         musicLastError = 'ClubEZ is not connected to a ready voice channel. Use /join or select Connect Bot in the dashboard.';
         return;
       }
+
+      let resourceCreated = false;
+
+      // 1. Primary audio stream: @distube/ytdl-core v5.0.1
       try {
-        const input = await play.stream(next.url);
-        const resource = createAudioResource(input.stream, {
-          inputType: input.type,
+        const stream = ytdlClient.download(next.url, {
+          filter: { hasAudio: true, hasVideo: false },
+          highWaterMark: 1 << 25,
+        });
+
+        stream.on('error', (err: any) => {
+          console.error('[YTDL STREAM EVENT ERROR]', err.message);
+        });
+
+        const resource = createAudioResource(stream, {
           inlineVolume: true,
           metadata: next,
         });
@@ -414,10 +497,37 @@ async function startNextMusicTrack(): Promise<void> {
         connection.subscribe(musicPlayer);
         musicLastError = null;
         musicPlayer.play(resource);
+        resourceCreated = true;
         console.log(`[MUSIC] Playing "${next.title}" in voice channel ${connection.joinConfig.channelId}`);
         return;
-      } catch (error: any) {
-        musicLastError = `Could not play "${next.title}": ${error.message}`;
+      } catch (ytdlErr: any) {
+        console.warn(`[YTDL DOWNLOAD FAILED for "${next.title}"]:`, ytdlErr.message);
+      }
+
+      // 2. Secondary fallback: play-dl stream
+      if (!resourceCreated) {
+        try {
+          const input = await play.stream(next.url);
+          const resource = createAudioResource(input.stream, {
+            inputType: input.type,
+            inlineVolume: true,
+            metadata: next,
+          });
+          resource.volume?.setVolume(musicVolume / 100);
+          musicCurrentResource = resource;
+          connection.subscribe(musicPlayer);
+          musicLastError = null;
+          musicPlayer.play(resource);
+          resourceCreated = true;
+          console.log(`[MUSIC FALLBACK] Playing "${next.title}" via play-dl`);
+          return;
+        } catch (playErr: any) {
+          console.warn(`[PLAY-DL STREAM FAILED for "${next.title}"]:`, playErr.message);
+        }
+      }
+
+      if (!resourceCreated) {
+        musicLastError = `Could not stream "${next.title}". YouTube restricted the audio stream.`;
         console.error('[MUSIC STREAM ERROR]', musicLastError);
         musicCurrentTrack = null;
         musicCurrentResource = null;
@@ -473,7 +583,9 @@ function stopMusicPlayback() {
 // Summon ClubEZ into a voice channel and wait for Discord's Ready handshake.
 async function joinVoice(guild: any, channelId: string) {
   const channel = guild?.channels.cache.get(channelId);
-  if (!channel || channel.type !== ChannelType.GuildVoice) throw new Error('Voice channel was not found in this server.');
+  if (!channel || (!channel.isVoiceBased?.() && channel.type !== ChannelType.GuildVoice)) {
+    throw new Error('Voice channel was not found in this server.');
+  }
   const botMember = guild.members.me || (discordBot.user && guild.members.cache.get(discordBot.user.id));
   const permissions = botMember ? channel.permissionsFor(botMember) : null;
   if (!permissions?.has([PermissionFlagsBits.Connect, PermissionFlagsBits.Speak])) {
@@ -481,10 +593,19 @@ async function joinVoice(guild: any, channelId: string) {
   }
 
   let connection = getVoiceConnection(guild.id);
+
+  // If already connected and ready in this channel, reuse immediately
+  if (connection && connection.joinConfig.channelId === channelId && connection.state.status === VoiceConnectionStatus.Ready) {
+    connection.subscribe(musicPlayer);
+    musicVcChannelId = channelId;
+    return connection;
+  }
+
   if (connection && connection.joinConfig.channelId !== channelId) {
-    connection.destroy();
+    try { connection.destroy(); } catch {}
     connection = undefined;
   }
+
   if (!connection) {
     connection = joinVoiceChannel({
       channelId,
@@ -496,7 +617,34 @@ async function joinVoice(guild: any, channelId: string) {
   }
 
   connection.subscribe(musicPlayer);
-  await entersState(connection, VoiceConnectionStatus.Ready, 15_000);
+
+  // Handle sudden disconnects or network shifts
+  connection.on(VoiceConnectionStatus.Disconnected, async () => {
+    try {
+      await Promise.race([
+        entersState(connection!, VoiceConnectionStatus.Signalling, 5_000),
+        entersState(connection!, VoiceConnectionStatus.Connecting, 5_000),
+      ]);
+    } catch {
+      try { connection?.destroy(); } catch {}
+      if (musicVcChannelId === channelId) {
+        musicVcChannelId = null;
+      }
+    }
+  });
+
+  try {
+    if (connection.state.status !== VoiceConnectionStatus.Ready) {
+      await entersState(connection, VoiceConnectionStatus.Ready, 25_000);
+    }
+  } catch (err: any) {
+    console.error(`[DISCORD VC] Handshake warning in #${channel.name}:`, err.message);
+    if (connection.state.status !== VoiceConnectionStatus.Ready) {
+      try { connection.destroy(); } catch {}
+      throw new Error(`Voice connection to #${channel.name} timed out. Discord voice gateway took too long. Please try /play again.`);
+    }
+  }
+
   musicVcChannelId = channelId;
   console.log(`[DISCORD VC] ClubEZ ready in #${channel.name}`);
   return connection;
@@ -592,12 +740,13 @@ async function handleMusicTextCommand(message: Message, text: string): Promise<b
         return true;
       }
       const loading = await message.reply(`🔎 Searching for **${args.slice(0, 120)}**...`);
-      await joinVoice(guild, voiceChannel.id);
-      const found = (await searchYouTube(args, 1))[0];
+      const searchResults = await searchYouTube(args, 1);
+      const found = searchResults[0];
       if (!found) {
-        await loading.edit('No playable YouTube result found. Try a different title or link.');
+        await loading.edit(`❌ No playable result found for **"${args}"**. Try a different song name or direct link.`);
         return true;
       }
+      await joinVoice(guild, voiceChannel.id);
       const track = { ...found, requestedBy: message.author.username, addedAt: Date.now() };
       const queued = await enqueueMusicTrack(track);
       const embed = new EmbedBuilder()
@@ -679,11 +828,19 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
         }
 
         await interaction.deferReply();
-        await joinVoice(interaction.guild, vcChannel.id);
 
+        // 1. Resolve song first so we don't hold the voice connection if the song doesn't exist
         const searchResults = await searchYouTube(query, 1);
         const matched = searchResults[0];
-        if (!matched) throw new Error('No playable result found. Try a different title or public YouTube link.');
+        if (!matched) {
+          await interaction.editReply({
+            content: `❌ No playable result found for **"${query}"**. Try a different song name or direct YouTube/Spotify link.`
+          });
+          return;
+        }
+
+        // 2. Join voice channel safely with resilience
+        await joinVoice(interaction.guild, vcChannel.id);
 
         const newTrack: MusicQueueItem = {
           ...matched,
@@ -988,10 +1145,14 @@ discordBot.on(Events.InteractionCreate, async (interaction) => {
 
     } catch (cmdErr: any) {
       console.error(`[SLASH CMD ERROR /${commandName}]`, cmdErr.message);
+      let errorMsg = cmdErr.message || 'An unexpected error occurred';
+      if (/aborted|timeout|timed out/i.test(errorMsg)) {
+        errorMsg = 'Voice connection timed out. Discord voice servers took too long to respond. Please try /play again.';
+      }
       if (!interaction.replied && !interaction.deferred) {
-        await interaction.reply({ content: `❌ Command error: ${cmdErr.message}`, ephemeral: true }).catch(() => { });
+        await interaction.reply({ content: `❌ Command error: ${errorMsg}`, ephemeral: true }).catch(() => { });
       } else if (interaction.deferred) {
-        await interaction.editReply({ content: `❌ Command error: ${cmdErr.message}` }).catch(() => { });
+        await interaction.editReply({ content: `❌ Command error: ${errorMsg}` }).catch(() => { });
       }
     }
     return;
