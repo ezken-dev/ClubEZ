@@ -3601,6 +3601,130 @@ async function executeServerAction(actionName: string, args: any, currentChannel
       };
     }
 
+    if (actionName === 'audit_channel_permissions') {
+      let targetChannel = currentChannels.find(c => c.id === args.channelId || c.name.toLowerCase() === (args.channelName || '').replace('#', '').toLowerCase());
+      if (!targetChannel && args.channelName) {
+        targetChannel = currentChannels.find(c => c.name.toLowerCase().includes(args.channelName.replace('#', '').toLowerCase()));
+      }
+      if (!targetChannel) return { action: 'AUDIT_CHANNEL_NOT_FOUND', details: args, result: `Could not find channel "${args.channelName}"`, success: false };
+
+      try {
+        const res = await fetch(`https://discord.com/api/v10/channels/${targetChannel.id}`, { headers: getDiscordHeaders() });
+        if (res.ok) {
+          const chan = await res.json();
+          const overwrites = Array.isArray(chan.permission_overwrites) ? chan.permission_overwrites : [];
+          const summaries: string[] = [];
+
+          for (const ow of overwrites) {
+            let targetLabel = ow.id;
+            if (ow.id === DISCORD_GUILD_ID) targetLabel = '@everyone';
+            else {
+              const matchedRole = currentRoles.find(r => r.id === ow.id);
+              if (matchedRole) targetLabel = `@${matchedRole.name}`;
+            }
+
+            const allowBits = BigInt(ow.allow || '0');
+            const denyBits = BigInt(ow.deny || '0');
+
+            const allowList: string[] = [];
+            const denyList: string[] = [];
+
+            if ((allowBits & 1024n) !== 0n) allowList.push('ViewChannel');
+            if ((denyBits & 1024n) !== 0n) denyList.push('ViewChannel');
+            if ((allowBits & 2048n) !== 0n) allowList.push('SendMessages');
+            if ((denyBits & 2048n) !== 0n) denyList.push('SendMessages');
+            if ((allowBits & 1048576n) !== 0n) allowList.push('Connect');
+            if ((denyBits & 1048576n) !== 0n) denyList.push('Connect');
+            if ((allowBits & 2097152n) !== 0n) allowList.push('Speak');
+            if ((denyBits & 2097152n) !== 0n) denyList.push('Speak');
+            if ((allowBits & 33554432n) !== 0n) allowList.push('UseVoiceActivity');
+            if ((denyBits & 33554432n) !== 0n) denyList.push('UseVoiceActivity (Forced PTT)');
+            if ((allowBits & 8192n) !== 0n) allowList.push('ManageMessages');
+            if ((denyBits & 8192n) !== 0n) denyList.push('ManageMessages');
+
+            summaries.push(`• **${targetLabel}**: Allow: [${allowList.join(', ') || 'None'}] | Deny: [${denyList.join(', ') || 'None'}]`);
+          }
+
+          return {
+            action: 'AUDITED_CHANNEL_PERMISSIONS',
+            details: { channel: targetChannel.name, overwritesCount: overwrites.length },
+            result: `📋 **Permission Overwrites on #${targetChannel.name}**:\n` + (summaries.join('\n') || 'No special channel overrides configured (inheriting server defaults).'),
+            success: true,
+          };
+        }
+      } catch (err: any) {
+        return { action: 'AUDIT_CHANNEL_FAILED', details: args, result: `Audit error: ${err.message}`, success: false };
+      }
+    }
+
+    if (actionName === 'audit_role_permissions') {
+      const roleName = (args.name || '').replace('@', '').toLowerCase();
+      const role = currentRoles.find(r => r.id === args.roleId || r.name.toLowerCase() === roleName || r.name.toLowerCase().includes(roleName));
+      if (!role) return { action: 'AUDIT_ROLE_NOT_FOUND', details: args, result: `Could not find role "${args.name}"`, success: false };
+
+      const bits = BigInt(role.permissions || '0');
+      const perms: string[] = [];
+      if ((bits & 8n) !== 0n) perms.push('Administrator');
+      if ((bits & 32n) !== 0n) perms.push('ManageServer');
+      if ((bits & 268435456n) !== 0n) perms.push('ManageRoles');
+      if ((bits & 16n) !== 0n) perms.push('ManageChannels');
+      if ((bits & 8192n) !== 0n) perms.push('ManageMessages');
+      if ((bits & 1099511627776n) !== 0n) perms.push('ModerateMembers(Timeout)');
+      if ((bits & 2n) !== 0n) perms.push('KickMembers');
+      if ((bits & 4n) !== 0n) perms.push('BanMembers');
+      if ((bits & 1024n) !== 0n) perms.push('ViewChannels');
+      if ((bits & 2048n) !== 0n) perms.push('SendMessages');
+      if ((bits & 1048576n) !== 0n) perms.push('ConnectVoice');
+      if ((bits & 2097152n) !== 0n) perms.push('SpeakVoice');
+      if ((bits & 33554432n) !== 0n) perms.push('UseVoiceActivity(OpenMic)');
+      if ((bits & 16384n) !== 0n) perms.push('EmbedLinks');
+      if ((bits & 32768n) !== 0n) perms.push('AttachFiles');
+
+      return {
+        action: 'AUDITED_ROLE_PERMISSIONS',
+        details: { role: role.name, permissionsCount: perms.length },
+        result: `🛡️ **Role Permissions for @${role.name}** (Color: #${(role.color || 0).toString(16)}, Hoist: ${role.hoist ? 'Yes' : 'No'}):\n• Permissions: ${perms.join(', ') || 'No elevated permissions (Basic)'}`,
+        success: true,
+      };
+    }
+
+    if (actionName === 'get_audit_logs') {
+      try {
+        const res = await fetch(`https://discord.com/api/v10/guilds/${DISCORD_GUILD_ID}/audit-logs?limit=8`, {
+          headers: getDiscordHeaders(),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          const entries = Array.isArray(data.audit_log_entries) ? data.audit_log_entries : [];
+          const users = Array.isArray(data.users) ? data.users : [];
+
+          const actionNames: Record<number, string> = {
+            1: 'CREATE_CHANNEL', 2: 'UPDATE_CHANNEL', 3: 'DELETE_CHANNEL',
+            10: 'CREATE_ROLE', 11: 'UPDATE_ROLE', 12: 'DELETE_ROLE',
+            20: 'KICK_MEMBER', 22: 'BAN_MEMBER', 23: 'UNBAN_MEMBER',
+            24: 'UPDATE_MEMBER', 25: 'MEMBER_ROLE_UPDATE',
+            72: 'MESSAGE_DELETE', 73: 'MESSAGE_BULK_DELETE',
+          };
+
+          const logLines = entries.map((e: any) => {
+            const actor = users.find((u: any) => u.id === e.user_id)?.username || `User(${e.user_id})`;
+            const actionStr = actionNames[e.action_type] || `ACTION_${e.action_type}`;
+            const reason = e.reason ? ` - Reason: "${e.reason}"` : '';
+            return `• **${actor}**: ${actionStr} (Target: ${e.target_id || 'N/A'})${reason}`;
+          });
+
+          return {
+            action: 'FETCHED_AUDIT_LOGS',
+            details: { count: entries.length },
+            result: `📋 **Recent Discord Audit Log Events**:\n` + (logLines.join('\n') || 'No recent audit events logged.'),
+            success: true,
+          };
+        }
+      } catch (err: any) {
+        return { action: 'FETCH_AUDIT_LOGS_FAILED', details: {}, result: `Audit log error: ${err.message}`, success: false };
+      }
+    }
+
     // ==================== ROLE MANAGEMENT ====================
     if (actionName === 'create_role') {
       const colorInt = parseInt((args.colorHex || '#E50914').replace('#', ''), 16) || 15010068;
@@ -4462,11 +4586,48 @@ const getServerOverviewDeclaration: FunctionDeclaration = {
   },
 };
 
+const auditChannelPermissionsDeclaration: FunctionDeclaration = {
+  name: 'audit_channel_permissions',
+  description: 'Inspect exact permission overwrites (view, send, connect, speak, voice activity) on a specific channel for @everyone and roles',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      channelName: { type: Type.STRING, description: 'Name of channel to audit' },
+      channelId: { type: Type.STRING, description: 'Optional channel ID' },
+    },
+    required: ['channelName'],
+  },
+};
+
+const auditRolePermissionsDeclaration: FunctionDeclaration = {
+  name: 'audit_role_permissions',
+  description: 'Inspect elevated permissions (admin, manage channels, timeout, kick, ban, voice activity) granted to a specific role',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {
+      name: { type: Type.STRING, description: 'Name of the role to audit' },
+    },
+    required: ['name'],
+  },
+};
+
+const getAuditLogsDeclaration: FunctionDeclaration = {
+  name: 'get_audit_logs',
+  description: 'Fetch the recent moderation and administrative actions recorded in the Discord server audit log',
+  parameters: {
+    type: Type.OBJECT,
+    properties: {},
+  },
+};
+
 // All available super-admin tools for Gemini
 const allSuperAdminTools = [{
   functionDeclarations: [
     checkVoicePermissionsDeclaration,
     disablePushToTalkDeclaration,
+    auditChannelPermissionsDeclaration,
+    auditRolePermissionsDeclaration,
+    getAuditLogsDeclaration,
     editChannelPermissionsDeclaration,
     bulkEditChannelPermissionsDeclaration,
     createRoleDeclaration,
@@ -4534,8 +4695,8 @@ app.post('/api/gemini/architect', async (req: Request, res: Response) => {
       .join(', ');
 
     const systemInstruction = `You are the Autonomous Discord Server Architect and Master Super Admin AI for "Club EZKEN" (Guild ID: ${DISCORD_GUILD_ID}).
-You have FULL, UNRESTRICTED ADMINISTRATOR ACCESS to execute real-time modifications directly on the live Discord server through your tools.
-The bot in the server is named "ClubEZ" and has full administrator permissions.
+You possess comprehensive, fluent, expert-level knowledge of Discord server architecture, permissions bitfields, channel design, hierarchy, voice settings, and community moderation best practices.
+You speak in a natural, friendly, expert human tone — never like a rigid robot.
 
 CURRENT DISCORD SERVER CHANNELS:
 ${channelNamesList || 'general, announcements, lounge-welcome, mod-logs'}
@@ -4546,34 +4707,34 @@ ${roleNamesList || 'Owner, Moderator, Member'}
 CURRENT XP LEVEL TIERS:
 ${Object.entries(levelTiers).map(([lvl, t]) => `Level ${lvl}: ${t.name} (${t.color})`).join(', ')}
 
-CORE DISCORD EXPERTISE & DIRECTIVES:
-1. PUSH-TO-TALK & VOICE ACTIVITY DETECTION (VAD):
-   - When asked to disable push-to-talk, fix voice chat, allow normal talking, or enable open mic / voice activity detection, CALL "disable_push_to_talk" IMMEDIATELY!
-   - In Discord, forced push-to-talk happens when the permission "USE_VAD" (Voice Activity Detection, bit 33554432) is denied or not granted. Calling "disable_push_to_talk" fixes this across @everyone, leveling roles, and all voice channels!
-   - DO NOT create a new channel when the user is asking about voice chat permissions or push-to-talk!
+DISCORD PERMISSION ARCHITECTURE & BITFIELDS:
+- Voice Activity Detection (USE_VAD): 33554432 (When denied, members are forced to use Push-to-Talk! When allowed, members have open mic / voice activity)
+- Voice Speaking & Connection: SPEAK = 2097152, CONNECT = 1048576, STREAM = 512, PRIORITY_SPEAKER = 256
+- Text & Content: SEND_MESSAGES = 2048, VIEW_CHANNEL = 1024, EMBED_LINKS = 16384, ATTACH_FILES = 32768, USE_EXTERNAL_EMOJIS = 262144
+- Administration & Moderation: ADMINISTRATOR = 8, MANAGE_GUILD = 32, MANAGE_ROLES = 268435456, MANAGE_CHANNELS = 16, MANAGE_MESSAGES = 8192, MODERATE_MEMBERS (Timeout) = 1099511627776, KICK_MEMBERS = 2, BAN_MEMBERS = 4
 
-2. PERMISSION MANAGEMENT:
-   - You can edit channel permissions for any role or member using "edit_channel_permissions" or "bulk_edit_channel_permissions".
-   - Key permission bit flags:
-     * USE_VAD: 33554432 (Use Voice Activity)
-     * SPEAK: 2097152 (Speak in Voice)
-     * CONNECT: 1048576 (Connect to Voice)
-     * SEND_MESSAGES: 2048
-     * VIEW_CHANNEL: 1024
-     * ATTACH_FILES: 32768
-     * EMBED_LINKS: 16384
-     * USE_EXTERNAL_EMOJIS: 262144
-     * MANAGE_MESSAGES: 8192
+CONFIRMATION & COLLABORATION PROTOCOL:
+1. READ-ONLY AUDITING & QUESTIONS:
+   - When the user asks a question or asks you to check/audit something (e.g. "can u check does everyone need push to talk?", "what channels exist?", "audit #general permissions", "check role permissions", "how many members?"):
+   - ALWAYS call the relevant audit/check tool immediately!
+   - Answer their question directly and thoroughly in natural human English.
+   - If an issue is found (e.g. push-to-talk is restricting voice channels), explain the diagnosis and ask:
+     "Would you like me to enable open mic (Voice Activity) for everyone so they can speak freely?"
 
-3. CHANNEL & ROLE MANAGEMENT:
-   - You can create, edit, rename, and delete any channel ("create_channel", "edit_channel", "delete_channel").
-   - You can create, edit, recolor, and delete any role ("create_role", "edit_role", "delete_role").
-   - You can moderate members ("moderate_member": TIMEOUT, UNTIMEOUT, KICK, BAN, UNBAN) or update nicknames and roles ("edit_member").
-   - You can purge messages ("purge_messages") or broadcast announcements ("send_announcement", "send_message").
-
-4. CONVERSATION CONTEXT & INTELLIGENCE:
-   - You have full conversational memory of what you did in previous turns! When the user says "do it", "undo that", "change its color to blue", "also do that for the voice channels", refer to previously discussed channels, roles, and actions!
-   - Always call the necessary tools first, then give an enthusiastic, professional confirmation of what was changed on the live server.`;
+2. MODIFICATIONS & SERVER ACTIONS (Creation, Deletion, Permission Changes, Moderation):
+   - When the user asks for a server modification (e.g. creating channels, creating roles, deleting things, changing permissions):
+     * If the user HAS NOT confirmed yet (their prompt does not say "yes", "proceed", "do it", "confirm", "go ahead", "execute now"):
+       First outline your plan clearly:
+       • Explain what changes you plan to make
+       • Which channels, roles, or members will be affected
+       • The specific settings, colors, or permissions
+       Then ask:
+       "Would you like me to proceed with this plan, or would you like to make any adjustments first (like changing names, colors, or channels)?"
+       Do NOT execute the modifying tool until they confirm!
+     * If the user CONFIRMS (says "yes", "proceed", "do it", "confirm", "looks good", "go ahead", "execute") OR explicitly commands direct execution ("do it now", "execute immediately"):
+       Call the execution tool immediately and report the live completed results!
+     * If the user wants to adjust (says "okay instead of that do this or that", "make it blue instead", "only for voice channels"):
+       Acknowledge their adjustment intelligently, refine the plan parameters, and ask for confirmation on the updated plan!`;
 
     let aiMessage = '';
     let modelWorked = false;
