@@ -32,6 +32,7 @@ import {
   VoiceConnectionStatus,
   AudioPlayerStatus,
   NoSubscriberBehavior,
+  StreamType,
   createAudioPlayer,
   createAudioResource,
   entersState,
@@ -326,7 +327,7 @@ let musicLastError: string | null = null;
 let musicIsLoading = false;
 let musicCurrentResource: any = null;
 const musicPlayer = createAudioPlayer({
-  behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
+  behaviors: { noSubscriber: NoSubscriberBehavior.Play },
 });
 
 musicPlayer.on('stateChange', (_oldState, newState) => {
@@ -477,34 +478,67 @@ async function startNextMusicTrack(): Promise<void> {
 
       let resourceCreated = false;
 
-      // 1. Primary audio stream: @distube/ytdl-core v5.0.1
+      // 1. Primary audio stream: @distube/ytdl-core v5.0.1 with WebM Opus direct streaming (~1s start, zero FFmpeg lag)
       try {
         const stream = ytdlClient.download(next.url, {
-          filter: { hasAudio: true, hasVideo: false },
+          filter: (f: any) => f.hasAudio && !f.hasVideo && (f.container === 'webm' || f.codecs?.includes('opus')),
+          quality: 'highestaudio',
           highWaterMark: 1 << 25,
         });
 
         stream.on('error', (err: any) => {
-          console.error('[YTDL STREAM EVENT ERROR]', err.message);
+          console.error('[YTDL WEBM STREAM ERROR]', err.message);
         });
 
         const resource = createAudioResource(stream, {
+          inputType: StreamType.WebmOpus,
           inlineVolume: true,
           metadata: next,
         });
-        resource.volume?.setVolume(musicVolume / 100);
+        if (resource.volume) resource.volume.setVolume(musicVolume / 100);
         musicCurrentResource = resource;
         connection.subscribe(musicPlayer);
         musicLastError = null;
         musicPlayer.play(resource);
         resourceCreated = true;
-        console.log(`[MUSIC] Playing "${next.title}" in voice channel ${connection.joinConfig.channelId}`);
+        console.log(`[MUSIC] Fast-streaming "${next.title}" via WebmOpus in voice channel ${connection.joinConfig.channelId}`);
         return;
       } catch (ytdlErr: any) {
-        console.warn(`[YTDL DOWNLOAD FAILED for "${next.title}"]:`, ytdlErr.message);
+        console.warn(`[YTDL WEBM-OPUS FAILED for "${next.title}"]:`, ytdlErr.message);
       }
 
-      // 2. Secondary fallback: play-dl stream
+      // 2. Secondary fallback: @distube/ytdl-core standard audio
+      if (!resourceCreated) {
+        try {
+          const stream = ytdlClient.download(next.url, {
+            filter: { hasAudio: true, hasVideo: false },
+            quality: 'highestaudio',
+            highWaterMark: 1 << 25,
+          });
+
+          stream.on('error', (err: any) => {
+            console.error('[YTDL ARBITRARY STREAM ERROR]', err.message);
+          });
+
+          const resource = createAudioResource(stream, {
+            inputType: StreamType.Arbitrary,
+            inlineVolume: true,
+            metadata: next,
+          });
+          if (resource.volume) resource.volume.setVolume(musicVolume / 100);
+          musicCurrentResource = resource;
+          connection.subscribe(musicPlayer);
+          musicLastError = null;
+          musicPlayer.play(resource);
+          resourceCreated = true;
+          console.log(`[MUSIC] Streaming "${next.title}" via Arbitrary`);
+          return;
+        } catch (arbErr: any) {
+          console.warn(`[YTDL ARBITRARY FAILED for "${next.title}"]:`, arbErr.message);
+        }
+      }
+
+      // 3. Tertiary fallback: play-dl stream
       if (!resourceCreated) {
         try {
           const input = await play.stream(next.url);
@@ -513,7 +547,7 @@ async function startNextMusicTrack(): Promise<void> {
             inlineVolume: true,
             metadata: next,
           });
-          resource.volume?.setVolume(musicVolume / 100);
+          if (resource.volume) resource.volume.setVolume(musicVolume / 100);
           musicCurrentResource = resource;
           connection.subscribe(musicPlayer);
           musicLastError = null;
@@ -652,9 +686,17 @@ async function joinVoice(guild: any, channelId: string) {
 
 function leaveVoice(guildId: string) {
   stopMusicPlayback();
-  const connection = getVoiceConnection(guildId);
-  if (connection) connection.destroy();
+  const connection = getVoiceConnection(guildId) || getVoiceConnection(DISCORD_GUILD_ID);
+  if (connection) {
+    try { connection.destroy(); } catch {}
+  }
+  const guild = discordBot.guilds.cache.get(guildId) || discordBot.guilds.cache.get(DISCORD_GUILD_ID);
+  const botMember = guild?.members.me;
+  if (botMember?.voice?.channel) {
+    botMember.voice.disconnect().catch(() => {});
+  }
   musicVcChannelId = null;
+  console.log(`[DISCORD VC] Disconnected and left voice channel in guild ${guildId}`);
 }
 
 async function handleMusicTextCommand(message: Message, text: string): Promise<boolean> {

@@ -5,9 +5,9 @@
   "main": "server.ts",
   "type": "module",
   "scripts": {
-    "start": "npx tsx server.ts",
+    "start": "npm install --omit=dev && npx tsx server.ts",
     "start:js": "node src/index.js",
-    "start:ts": "npx tsx server.ts",
+    "start:ts": "npm install --omit=dev && npx tsx server.ts",
     "deploy": "node src/deploy-commands.js",
     "pm2:start": "pm2 start ecosystem.config.cjs",
     "pm2:logs": "pm2 logs club-ezken-bot",
